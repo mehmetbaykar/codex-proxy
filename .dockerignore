@@ -1,0 +1,11 @@
+.git
+.github
+.state*
+target
+Dockerfile
+*.log
+scripts
+volume
+.env
+.env.default
+docker-compose.yml

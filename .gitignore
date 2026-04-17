@@ -1,0 +1,23 @@
+# Build artifacts
+/target
+
+# Local state and runtime volumes
+.state/
+.state-cursor-test/
+.state-release*/
+/volume/
+
+# Env / secrets
+/.env
+
+# Logs
+*.log
+
+# Tooling caches
+scripts/__pycache__/
+
+# macOS
+.DS_Store
+
+# Internal spec — local only
+SPEC.md

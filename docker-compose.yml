@@ -1,0 +1,21 @@
+# codex-proxy — single-container deploy.
+# 1. cp .env.default .env   and fill in CURSOR_PROXY_API_KEY.
+# 2. provide Codex auth: either mount auth.json at ./volume/auth/auth.json
+#    or set CODEX_ACCESS_TOKEN in .env.
+# 3. docker compose up -d
+# Logs land on the host at ./volume/logs/ (tail requests.jsonl for live reqs).
+services:
+  codex-proxy:
+    image: mehmetbaykar/codex-proxy:latest
+    container_name: codex-proxy
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-3000}:3000"
+    environment:
+      CURSOR_PROXY_API_KEY: ${CURSOR_PROXY_API_KEY}
+      IS_DEBUG: ${IS_DEBUG:-0}
+      CODEX_ACCESS_TOKEN: ${CODEX_ACCESS_TOKEN:-}
+    volumes:
+      # single host folder ↔ /app/state. Container auto-creates
+      # auth/, db/, files/, logs/, logs/payloads/ inside.
+      - ./volume:/app/state
