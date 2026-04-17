@@ -12,8 +12,7 @@ manual_strip = "deny"
 redundant_closure = "deny"
 redundant_clone = "deny"
 unwrap_used = "deny"
-# The suggested collapse uses `&& let` chains, stabilized only in Rust 1.88;
-# our Dockerfile pins rust-1.87, so collapsing would break the container build.
+# Style lint from clippy 1.91+ that we don't care to enforce project-wide.
 collapsible_if = "allow"
 
 [dependencies]
