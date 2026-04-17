@@ -44,10 +44,17 @@ pub(crate) async fn upstream_error_response(response: reqwest::Response) -> Resp
 }
 
 pub(crate) fn upstream_open_error_response(err: &anyhow::Error) -> Response {
-    if err.to_string().contains("missing upstream access token") {
+    let message = err.to_string();
+    if message.contains("Cannot read") && message.contains("codex-proxy login") {
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Codex upstream authentication is missing. Set CODEX_ACCESS_TOKEN or mount auth.json.",
+            "Codex upstream authentication is missing. Run: docker exec -it codex-proxy codex-proxy login",
+        );
+    }
+    if message.contains("refresh_token rejected") {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Codex refresh token is no longer valid. Run: docker exec -it codex-proxy codex-proxy login",
         );
     }
     json_error(StatusCode::BAD_GATEWAY, "Failed to open upstream stream")

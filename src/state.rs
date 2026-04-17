@@ -9,6 +9,8 @@ use serde_json::Value;
 use sqlx::{Pool, Sqlite};
 use tokio::sync::Mutex;
 
+use crate::codex_auth::CodexAuth;
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) client: Client,
@@ -21,6 +23,7 @@ pub(crate) struct AppState {
     pub(crate) log_full_body: bool,
     pub(crate) log_write_lock: Arc<Mutex<()>>,
     pub(crate) model_aliases: Arc<HashMap<String, String>>,
+    pub(crate) auth: Arc<CodexAuth>,
 }
 
 #[derive(Clone, Default)]

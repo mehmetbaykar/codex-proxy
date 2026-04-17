@@ -790,6 +790,7 @@ mod tests {
             log_full_body: false,
             log_write_lock: Arc::new(Mutex::new(())),
             model_aliases: Arc::new(std::collections::HashMap::new()),
+            auth: Arc::new(crate::codex_auth::CodexAuth::for_tests()),
         })
     }
 

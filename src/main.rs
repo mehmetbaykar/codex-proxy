@@ -5,6 +5,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tokio::fs;
 use tokio::sync::Mutex;
 
+mod codex_auth;
 mod config;
 mod errors;
 mod files;
@@ -21,6 +22,17 @@ mod upstream;
 async fn main() -> Result<()> {
     config::init_tracing();
     let config = config::Config::from_env();
+
+    let auth_path = config.state_root.join("auth").join("auth.json");
+
+    if matches!(std::env::args().nth(1).as_deref(), Some("login")) {
+        if let Some(parent) = auth_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let http = config::build_upstream_client(false)?;
+        codex_auth::run_login(auth_path, http).await?;
+        return Ok(());
+    }
 
     let files_dir = config.files_dir();
     let db_dir = config.db_dir();
@@ -44,8 +56,11 @@ async fn main() -> Result<()> {
         .context("failed to open sqlite db")?;
     files::init_db(&db).await?;
 
+    let upstream_client = config::build_upstream_client(config.tune_upstream_transport)?;
+    let auth = codex_auth::CodexAuth::load(auth_path, upstream_client.clone()).await?;
+
     let state = state::AppState {
-        client: config::build_upstream_client(config.tune_upstream_transport)?,
+        client: upstream_client,
         db,
         files_dir,
         logs_dir: logs_dir.clone(),
@@ -55,6 +70,7 @@ async fn main() -> Result<()> {
         log_full_body: config.log_full_body,
         log_write_lock: Arc::new(Mutex::new(())),
         model_aliases: config.model_aliases.clone(),
+        auth: Arc::new(auth),
     };
 
     let app = routes::build_router(state);

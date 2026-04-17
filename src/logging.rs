@@ -56,14 +56,6 @@ pub(crate) fn forwarded_client_ip(headers: &HeaderMap) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-        .or_else(|| {
-            headers
-                .get("cf-connecting-ip")
-                .and_then(|value| value.to_str().ok())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-        })
 }
 
 async fn write_jsonl_log(state: &AppState, file_name: &str, value: &Value) {

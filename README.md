@@ -12,10 +12,14 @@ Spec: [SPEC.md](SPEC.md).
 1. `mkdir -p ~/docker-apps/codex-proxy && cd ~/docker-apps/codex-proxy`
 2. Copy `docker-compose.yml` and `.env.default` from this repo into that folder.
 3. `cp .env.default .env` and set `CURSOR_PROXY_API_KEY` (required).
-4. Provide Codex upstream auth — pick one:
-   - `mkdir -p volume/auth && cp ~/.codex/auth.json volume/auth/auth.json`
-   - or paste the token into `CODEX_ACCESS_TOKEN` in `.env`.
-5. `docker compose up -d`
+4. `docker compose up -d`
+5. Sign in to ChatGPT from inside the container:
+   ```
+   docker exec -it codex-proxy codex-proxy login
+   ```
+   Open the printed URL on any browser, enter the short code, approve.
+   Tokens are written to `./volume/auth/auth.json` and refreshed
+   automatically from then on (transparent to clients).
 
 Host port defaults to `3000`; change `HOST_PORT` in `.env` if nginx/Traefik
 needs a different one. Container always listens on `3000` internally.
@@ -94,7 +98,6 @@ State root defaults to `./.state/`. Override with `STATE_ROOT=/path`.
 | `LISTEN_ADDR` | — | Overrides `BIND_ADDR`+`PORT` when set. |
 | `STATE_ROOT` | `.state` (bin) / `/app/state` (container) | Root for auth/db/files/logs. |
 | `CODEX_UPSTREAM_URL` | `https://chatgpt.com/backend-api/codex/responses` | Upstream endpoint. |
-| `CODEX_ACCESS_TOKEN` | — | Direct bearer for upstream (alternative to mounting `auth.json`). |
 | `IS_DEBUG` | `0` | `1` turns on verbose tracing + raw payload dumps. |
 | `PROXY_LOG_FULL_BODY` | `0` | Same as `IS_DEBUG=1` payload dumping, without the debug tracing filter. |
 | `CODEX_MODEL_ALIASES` | `gpt-5.3-codex-spark-preview=gpt-5.3-codex-spark` | Extra client→canonical model rewrites. Format: `a=b,c=d`. |
