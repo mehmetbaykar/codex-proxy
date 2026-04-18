@@ -37,7 +37,7 @@ pub(crate) async fn build_chatgpt_upstream_headers(
             headers.insert("session_id", value);
         }
         headers.insert("originator", axum::http::HeaderValue::from_static("codex-proxy"));
-        if let Ok(value) = axum::http::HeaderValue::from_str("codex-proxy/0.1") {
+        if let Ok(value) = axum::http::HeaderValue::from_str("codex-proxy/0.2") {
             headers.insert(USER_AGENT, value);
         }
         if let Ok(value) = axum::http::HeaderValue::from_str(&context.request_id) {
@@ -114,7 +114,7 @@ async fn send_upstream(
         .bearer_auth(token)
         .header(CONTENT_TYPE, "application/json")
         .header("accept", "text/event-stream")
-        .header(USER_AGENT, "codex-proxy/0.1")
+        .header(USER_AGENT, "codex-proxy/0.2")
         .json(body);
     if state.upstream_identity_encoding {
         request = request.header(ACCEPT_ENCODING, "identity");
