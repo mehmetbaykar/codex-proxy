@@ -14,13 +14,8 @@ use uuid::Uuid;
 
 use crate::errors::{json_error, upstream_error_response, upstream_open_error_response};
 use crate::logging::{log_json_request, log_request_event};
-use crate::normalization::{normalize_chat_payload, normalize_responses_payload};
 use crate::state::{AppState, ClientStreamOptions, RequestContext, WsSessionState};
-use crate::streaming::{
-    SseParser, ToolStreamState, map_response_event_to_chat_chunk,
-    response_output_indicates_tool_calls, response_to_chat_message,
-};
-use crate::upstream::open_upstream_response;
+use crate::streaming::{SseParser, ToolStreamState};
 
 pub(crate) async fn post_responses(
     State(state): State<AppState>,
@@ -33,7 +28,11 @@ pub(crate) async fn post_responses(
     let raw_body = body.0;
     let mut normalized = raw_body.clone();
     let request_context = ctx.as_ref().map(|extension| &extension.0);
-    if let Err(response) = normalize_responses_payload(&state, &mut normalized).await {
+    if let Err(response) = state
+        .codex_adapter
+        .normalize_responses_payload(&state, &mut normalized)
+        .await
+    {
         log_json_request(
             &state,
             request_context,
@@ -79,7 +78,11 @@ pub(crate) async fn post_chat_completions(
     let raw_body = body.0;
     let mut upstream_body = raw_body.clone();
     let request_context = ctx.as_ref().map(|extension| &extension.0);
-    let client_options = match normalize_chat_payload(&state, &mut upstream_body).await {
+    let client_options = match state
+        .codex_adapter
+        .normalize_chat_payload(&state, &mut upstream_body)
+        .await
+    {
         Ok(options) => options,
         Err(response) => {
             log_json_request(
@@ -166,7 +169,11 @@ async fn ws_session_loop(
                 continue;
             }
         };
-        let msg_type = request.get("type").and_then(Value::as_str).unwrap_or("");
+        let msg_type = request
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         if msg_type != "response.create" && msg_type != "response.append" {
             let _ = socket
                 .send(Message::Text(
@@ -180,105 +187,24 @@ async fn ws_session_loop(
 
         {
             let session_state = session.lock().await;
-            if session_state.last_request.is_none() {
-                if msg_type != "response.create" {
+            match prepare_ws_request(&session_state, request, &msg_type) {
+                Ok(prepared) => request = prepared,
+                Err(message) => {
                     let _ = socket
                         .send(Message::Text(
-                            json!({"type":"error","message":"response.create must be first"})
-                                .to_string()
-                                .into(),
+                            json!({"type":"error","message":message}).to_string().into(),
                         ))
                         .await;
                     continue;
-                }
-                if request
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .is_empty()
-                {
-                    let _ = socket
-                        .send(Message::Text(
-                            json!({"type":"error","message":"missing model in response.create request"})
-                                .to_string()
-                                .into(),
-                        ))
-                        .await;
-                    continue;
-                }
-                if request.get("input").is_none() {
-                    request["input"] = json!([]);
-                }
-            } else {
-                if !request
-                    .get("input")
-                    .map(|value| value.is_array())
-                    .unwrap_or(false)
-                {
-                    let _ = socket
-                        .send(Message::Text(
-                            json!({"type":"error","message":"websocket request requires array field: input"})
-                                .to_string()
-                                .into(),
-                        ))
-                        .await;
-                    continue;
-                }
-                let prev_id = request
-                    .get("previous_response_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if prev_id.is_empty() {
-                    let mut merged = session_state
-                        .last_request
-                        .as_ref()
-                        .and_then(|value| value.get("input"))
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    if let Some(output) = session_state
-                        .last_response_output
-                        .as_ref()
-                        .and_then(Value::as_array)
-                        .cloned()
-                    {
-                        merged.extend(output);
-                    }
-                    let next = request
-                        .get("input")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    merged.extend(next);
-                    request["input"] = Value::Array(merged);
-                }
-
-                if request.get("model").is_none() {
-                    if let Some(model) = session_state
-                        .last_request
-                        .as_ref()
-                        .and_then(|value| value.get("model"))
-                        .cloned()
-                    {
-                        request["model"] = model;
-                    }
-                }
-                if request.get("instructions").is_none() {
-                    if let Some(instructions) = session_state
-                        .last_request
-                        .as_ref()
-                        .and_then(|value| value.get("instructions"))
-                        .cloned()
-                    {
-                        request["instructions"] = instructions;
-                    }
                 }
             }
         }
 
         request.as_object_mut().map(|object| object.remove("type"));
 
-        if normalize_responses_payload(&state, &mut request)
+        if state
+            .codex_adapter
+            .normalize_responses_payload(&state, &mut request)
             .await
             .is_err()
         {
@@ -302,7 +228,11 @@ async fn ws_session_loop(
         )
         .await;
 
-        match open_upstream_response(&state, request_context.as_ref(), &headers, &request).await {
+        match state
+            .codex_adapter
+            .open_upstream_response(&state, request_context.as_ref(), &headers, &request)
+            .await
+        {
             Ok(response) => {
                 let mut stream = response.bytes_stream();
                 let mut parser = SseParser::default();
@@ -367,7 +297,11 @@ async fn proxy_sse_passthrough(
     headers: &HeaderMap,
     payload: &Value,
 ) -> Response {
-    let response = match open_upstream_response(state, request_context, headers, payload).await {
+    let response = match state
+        .codex_adapter
+        .open_upstream_response(state, request_context, headers, payload)
+        .await
+    {
         Ok(response) => response,
         Err(err) => {
             tracing::warn!("upstream stream open failed: {err}");
@@ -421,7 +355,11 @@ async fn aggregate_responses(
 ) -> Response {
     let aggregate_started_at = Instant::now();
     let upstream_open_started_at = Instant::now();
-    let mut stream = match open_upstream_response(state, request_context, headers, payload).await {
+    let mut stream = match state
+        .codex_adapter
+        .open_upstream_response(state, request_context, headers, payload)
+        .await
+    {
         Ok(response) => {
             if !response.status().is_success() {
                 return upstream_error_response(response).await;
@@ -547,7 +485,11 @@ async fn stream_chat_chunks(
     payload: &Value,
     client_options: ClientStreamOptions,
 ) -> Response {
-    let response = match open_upstream_response(state, request_context, headers, payload).await {
+    let response = match state
+        .codex_adapter
+        .open_upstream_response(state, request_context, headers, payload)
+        .await
+    {
         Ok(response) => response,
         Err(err) => return upstream_open_error_response(&err),
     };
@@ -561,6 +503,7 @@ async fn stream_chat_chunks(
         .to_string();
     let created = crate::files::now_unix();
     let chunk_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+    let adapter = state.codex_adapter.clone();
 
     let payload_stream = response.bytes_stream();
     let out = async_stream::stream! {
@@ -587,7 +530,7 @@ async fn stream_chat_chunks(
                             continue;
                         }
                         if let Ok(value) = serde_json::from_str::<Value>(&event) {
-                            if let Some(line) = map_response_event_to_chat_chunk(
+                            if let Some(line) = adapter.map_response_event_to_chat_chunk(
                                 &value,
                                 &mut tool_state,
                                 &chunk_id,
@@ -599,7 +542,7 @@ async fn stream_chat_chunks(
 
                             if value.get("type").and_then(Value::as_str) == Some("response.completed") {
                                 saw_done = true;
-                                let finish_reason = if response_output_indicates_tool_calls(
+                                let finish_reason = if adapter.response_output_indicates_tool_calls(
                                     value.get("response"),
                                 ) {
                                     "tool_calls"
@@ -656,7 +599,11 @@ async fn aggregate_chat_completion(
     payload: &Value,
     client_options: ClientStreamOptions,
 ) -> Response {
-    let mut stream = match open_upstream_response(state, request_context, headers, payload).await {
+    let mut stream = match state
+        .codex_adapter
+        .open_upstream_response(state, request_context, headers, payload)
+        .await
+    {
         Ok(response) => {
             if !response.status().is_success() {
                 return upstream_error_response(response).await;
@@ -696,7 +643,10 @@ async fn aggregate_chat_completion(
         );
     };
     let usage = response.get("usage").cloned().unwrap_or_else(|| json!({}));
-    let finish_reason = if response_output_indicates_tool_calls(Some(&response)) {
+    let finish_reason = if state
+        .codex_adapter
+        .response_output_indicates_tool_calls(Some(&response))
+    {
         "tool_calls"
     } else {
         "stop"
@@ -708,7 +658,7 @@ async fn aggregate_chat_completion(
         "model": model,
         "choices":[{
             "index":0,
-            "message":response_to_chat_message(response.get("output")),
+            "message":state.codex_adapter.response_to_chat_message(response.get("output")),
             "finish_reason":finish_reason
         }],
         "usage":{
@@ -725,10 +675,90 @@ async fn aggregate_chat_completion(
     Json(completion).into_response()
 }
 
+fn prepare_ws_request(
+    session_state: &WsSessionState,
+    mut request: Value,
+    msg_type: &str,
+) -> Result<Value, &'static str> {
+    if session_state.last_request.is_none() {
+        if msg_type != "response.create" {
+            return Err("response.create must be first");
+        }
+        if request
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+        {
+            return Err("missing model in response.create request");
+        }
+        if request.get("input").is_none() {
+            request["input"] = json!([]);
+        }
+        return Ok(request);
+    }
+
+    if !request
+        .get("input")
+        .map(|value| value.is_array())
+        .unwrap_or(false)
+    {
+        return Err("websocket request requires array field: input");
+    }
+    let prev_id = request
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if prev_id.is_empty() {
+        let mut merged = session_state
+            .last_request
+            .as_ref()
+            .and_then(|value| value.get("input"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(output) = session_state
+            .last_response_output
+            .as_ref()
+            .and_then(Value::as_array)
+            .cloned()
+        {
+            merged.extend(output);
+        }
+        let next = request
+            .get("input")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        merged.extend(next);
+        request["input"] = Value::Array(merged);
+    }
+
+    if request.get("model").is_none()
+        && let Some(model) = session_state
+            .last_request
+            .as_ref()
+            .and_then(|value| value.get("model"))
+            .cloned()
+    {
+        request["model"] = model;
+    }
+    if request.get("instructions").is_none()
+        && let Some(instructions) = session_state
+            .last_request
+            .as_ref()
+            .and_then(|value| value.get("instructions"))
+            .cloned()
+    {
+        request["instructions"] = instructions;
+    }
+
+    Ok(request)
+}
+
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
-    use std::sync::Arc;
 
     use anyhow::Result;
     use axum::Router;
@@ -737,16 +767,12 @@ mod tests {
     use axum::response::Response;
     use axum::routing::post;
     use serde_json::{Value, json};
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-    use tokio::fs;
     use tokio::net::TcpListener;
-    use tokio::sync::Mutex;
     use tower::util::ServiceExt;
-    use uuid::Uuid;
 
-    use crate::files::init_db;
     use crate::routes::build_router;
-    use crate::state::AppState;
+    use crate::state::WsSessionState;
+    use crate::test_support::test_state;
 
     async fn mock_upstream() -> Response {
         let stream = async_stream::stream! {
@@ -760,38 +786,6 @@ mod tests {
             .headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         response
-    }
-
-    async fn test_state(upstream_url: String) -> Result<AppState> {
-        let root = std::env::temp_dir().join(format!("codex-proxy-test-{}", Uuid::new_v4()));
-        let files_dir = root.join("files");
-        let logs_dir = root.join("logs");
-        let db_dir = root.join("db");
-        fs::create_dir_all(&files_dir).await?;
-        fs::create_dir_all(&logs_dir).await?;
-        fs::create_dir_all(&db_dir).await?;
-        let db = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(db_dir.join("proxy.sqlite3"))
-                    .create_if_missing(true),
-            )
-            .await?;
-        init_db(&db).await?;
-        Ok(AppState {
-            client: reqwest::Client::builder().build()?,
-            db,
-            files_dir,
-            logs_dir,
-            upstream_url,
-            upstream_identity_encoding: false,
-            static_api_key: None,
-            log_full_body: false,
-            log_write_lock: Arc::new(Mutex::new(())),
-            model_aliases: Arc::new(std::collections::HashMap::new()),
-            auth: Arc::new(crate::codex_auth::CodexAuth::for_tests()),
-        })
     }
 
     #[tokio::test]
@@ -827,5 +821,30 @@ mod tests {
 
         server.abort();
         Ok(())
+    }
+
+    #[test]
+    fn websocket_append_merges_prior_input_and_output_when_previous_id_missing() {
+        let session_state = WsSessionState {
+            last_request: Some(json!({
+                "model":"gpt-5.4",
+                "instructions":"Keep it terse",
+                "input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]
+            })),
+            last_response_output: Some(json!([
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}
+            ])),
+        };
+        let request = json!({
+            "type":"response.append",
+            "input":[{"role":"user","content":[{"type":"input_text","text":"again"}]}]
+        });
+
+        let prepared = super::prepare_ws_request(&session_state, request, "response.append")
+            .expect("append should prepare successfully");
+
+        assert_eq!(prepared["model"], json!("gpt-5.4"));
+        assert_eq!(prepared["instructions"], json!("Keep it terse"));
+        assert_eq!(prepared["input"].as_array().map(Vec::len), Some(3));
     }
 }

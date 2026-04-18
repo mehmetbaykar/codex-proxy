@@ -279,3 +279,87 @@ pub(crate) async fn delete_file(
     }
     Json(serde_json::json!({ "id": file_id, "object": "file", "deleted": true })).into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode, header::CONTENT_TYPE};
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    use crate::routes::build_router;
+    use crate::test_support::test_state;
+
+    #[tokio::test]
+    async fn file_upload_list_get_and_delete_round_trip() -> Result<()> {
+        let state = test_state(String::new()).await?;
+        let app = build_router(state);
+
+        let boundary = "X-BOUNDARY";
+        let multipart_body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nassistants\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"hello.txt\"\r\nContent-Type: text/plain\r\n\r\nhello world\r\n--{boundary}--\r\n"
+        );
+
+        let upload_request = Request::builder()
+            .method("POST")
+            .uri("/v1/files")
+            .header(
+                CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(multipart_body))?;
+        let upload_response = app.clone().oneshot(upload_request).await?;
+        assert_eq!(upload_response.status(), StatusCode::OK);
+        let upload_body = to_bytes(upload_response.into_body(), usize::MAX).await?;
+        let uploaded: Value = serde_json::from_slice(&upload_body)?;
+        let file_id = uploaded["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("upload did not return file id"))?
+            .to_string();
+
+        let list_request = Request::builder()
+            .method("GET")
+            .uri("/v1/files")
+            .body(Body::empty())?;
+        let list_response = app.clone().oneshot(list_request).await?;
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = to_bytes(list_response.into_body(), usize::MAX).await?;
+        let listed: Value = serde_json::from_slice(&list_body)?;
+        assert!(listed["data"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["id"] == file_id)));
+
+        let get_request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/files/{file_id}"))
+            .body(Body::empty())?;
+        let get_response = app.clone().oneshot(get_request).await?;
+        assert_eq!(get_response.status(), StatusCode::OK);
+
+        let content_request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/files/{file_id}/content"))
+            .body(Body::empty())?;
+        let content_response = app.clone().oneshot(content_request).await?;
+        assert_eq!(content_response.status(), StatusCode::OK);
+        let content_body = to_bytes(content_response.into_body(), usize::MAX).await?;
+        assert_eq!(content_body, "hello world");
+
+        let delete_request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/files/{file_id}"))
+            .body(Body::empty())?;
+        let delete_response = app.clone().oneshot(delete_request).await?;
+        assert_eq!(delete_response.status(), StatusCode::OK);
+
+        let missing_request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/files/{file_id}"))
+            .body(Body::empty())?;
+        let missing_response = app.oneshot(missing_request).await?;
+        assert_eq!(missing_response.status(), StatusCode::NOT_FOUND);
+
+        Ok(())
+    }
+}

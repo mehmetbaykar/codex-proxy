@@ -6,6 +6,7 @@ use tokio::fs;
 use tokio::sync::Mutex;
 
 mod codex_auth;
+mod codex_adapter;
 mod config;
 mod errors;
 mod files;
@@ -15,6 +16,8 @@ mod normalization;
 mod routes;
 mod state;
 mod streaming;
+#[cfg(test)]
+mod test_support;
 mod types;
 mod upstream;
 
@@ -71,6 +74,7 @@ async fn main() -> Result<()> {
         log_write_lock: Arc::new(Mutex::new(())),
         model_aliases: config.model_aliases.clone(),
         auth: Arc::new(auth),
+        codex_adapter: Arc::new(codex_adapter::CodexAdapter::new()),
     };
 
     let app = routes::build_router(state);

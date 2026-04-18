@@ -6,16 +6,44 @@ use serde_json::json;
 use crate::types::{ErrorBody, ErrorEnvelope};
 
 pub(crate) fn json_error(status: StatusCode, message: &str) -> Response {
+    json_error_with_type(status, message, None)
+}
+
+pub(crate) fn json_error_with_type(
+    status: StatusCode,
+    message: &str,
+    error_type: Option<&str>,
+) -> Response {
     (
         status,
         Json(ErrorEnvelope {
             error: ErrorBody {
                 message: message.to_string(),
-                r#type: None,
+                r#type: error_type.map(ToOwned::to_owned),
             },
         }),
     )
         .into_response()
+}
+
+pub(crate) fn unsupported_proxy_route_error(path: &str) -> Response {
+    json_error_with_type(
+        StatusCode::NOT_IMPLEMENTED,
+        &format!(
+            "Route {path} is recognized but not supported by this proxy's stable Codex facade."
+        ),
+        Some("unsupported_route_error"),
+    )
+}
+
+pub(crate) fn impossible_upstream_route_error(path: &str) -> Response {
+    json_error_with_type(
+        StatusCode::NOT_IMPLEMENTED,
+        &format!(
+            "Route {path} requires durable response lifecycle semantics that cannot be truthfully provided over the ChatGPT Codex upstream."
+        ),
+        Some("upstream_capability_error"),
+    )
 }
 
 pub(crate) async fn upstream_error_response(response: reqwest::Response) -> Response {

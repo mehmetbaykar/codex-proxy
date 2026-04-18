@@ -55,6 +55,7 @@ pub(crate) async fn normalize_responses_payload(
     object.insert("store".to_string(), Value::Bool(false));
     object.insert("stream".to_string(), Value::Bool(true));
     ensure_instructions(object);
+    ensure_reasoning_encrypted_content(object);
     sanitize_upstream_payload(object);
     Ok(())
 }
@@ -110,6 +111,7 @@ pub(crate) async fn normalize_chat_payload(
     object.insert("store".to_string(), Value::Bool(false));
     object.insert("stream".to_string(), Value::Bool(true));
     ensure_instructions(object);
+    ensure_reasoning_encrypted_content(object);
     sanitize_upstream_payload(object);
     Ok(client_options)
 }
@@ -535,6 +537,31 @@ pub(crate) fn ensure_instructions(object: &mut serde_json::Map<String, Value>) {
     }
 }
 
+pub(crate) fn ensure_reasoning_encrypted_content(object: &mut serde_json::Map<String, Value>) {
+    match object.get_mut("include") {
+        Some(Value::Array(include)) => {
+            let has_encrypted_reasoning = include
+                .iter()
+                .any(|value| value.as_str() == Some("reasoning.encrypted_content"));
+            if !has_encrypted_reasoning {
+                include.push(Value::String("reasoning.encrypted_content".to_string()));
+            }
+        }
+        Some(_) => {
+            object.insert(
+                "include".to_string(),
+                Value::Array(vec![Value::String("reasoning.encrypted_content".to_string())]),
+            );
+        }
+        None => {
+            object.insert(
+                "include".to_string(),
+                Value::Array(vec![Value::String("reasoning.encrypted_content".to_string())]),
+            );
+        }
+    }
+}
+
 pub(crate) fn map_openai_compat_fields(object: &mut serde_json::Map<String, Value>) {
     let dropped: Vec<&str> = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
         .into_iter()
@@ -602,50 +629,11 @@ pub(crate) fn normalize_responses_input_shape(object: &mut serde_json::Map<Strin
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use anyhow::Result;
     use serde_json::{Value, json};
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-    use tokio::fs;
-    use tokio::sync::Mutex;
-    use uuid::Uuid;
 
     use super::{map_openai_compat_fields, normalize_responses_payload, promote_instruction_items};
-    use crate::files::init_db;
-    use crate::state::AppState;
-
-    async fn test_state() -> Result<AppState> {
-        let root = std::env::temp_dir().join(format!("codex-proxy-norm-{}", Uuid::new_v4()));
-        let files_dir = root.join("files");
-        let logs_dir = root.join("logs");
-        let db_dir = root.join("db");
-        fs::create_dir_all(&files_dir).await?;
-        fs::create_dir_all(&logs_dir).await?;
-        fs::create_dir_all(&db_dir).await?;
-        let db = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(db_dir.join("proxy.sqlite3"))
-                    .create_if_missing(true),
-            )
-            .await?;
-        init_db(&db).await?;
-        Ok(AppState {
-            client: reqwest::Client::builder().build()?,
-            db,
-            files_dir,
-            logs_dir,
-            upstream_url: String::new(),
-            upstream_identity_encoding: false,
-            static_api_key: None,
-            log_full_body: false,
-            log_write_lock: Arc::new(Mutex::new(())),
-            model_aliases: Arc::new(std::collections::HashMap::new()),
-            auth: Arc::new(crate::codex_auth::CodexAuth::for_tests()),
-        })
-    }
+    use crate::test_support::test_state;
 
     #[test]
     fn map_openai_fields_rewrites_reasoning_and_drops_token_caps() {
@@ -725,7 +713,7 @@ mod tests {
 
     #[tokio::test]
     async fn assistant_output_text_preserved_through_responses_normalization() -> Result<()> {
-        let state = test_state().await?;
+        let state = test_state(String::new()).await?;
         let mut payload = json!({
             "model":"gpt-5.4",
             "input":[
@@ -753,6 +741,31 @@ mod tests {
             json!("output_text"),
             "assistant content must keep output_text"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn normalization_always_requests_reasoning_encrypted_content() -> Result<()> {
+        let state = test_state(String::new()).await?;
+        let mut payload = json!({
+            "model":"gpt-5.4",
+            "input":"hello",
+            "include":["reasoning.summary"]
+        });
+
+        normalize_responses_payload(&state, &mut payload)
+            .await
+            .map_err(|_| anyhow::anyhow!("normalization failed"))?;
+
+        let include = payload["include"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("include should be an array"))?;
+        assert!(include
+            .iter()
+            .any(|value| value.as_str() == Some("reasoning.encrypted_content")));
+        assert!(include
+            .iter()
+            .any(|value| value.as_str() == Some("reasoning.summary")));
         Ok(())
     }
 

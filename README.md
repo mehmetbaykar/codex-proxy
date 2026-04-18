@@ -5,6 +5,30 @@ OpenAI-compatible proxy in front of the ChatGPT-backed Codex upstream
 `/v1/responses`, `/v1/responses/ws`, `/v1/files*`, and `/v1/models` so Cursor
 and other OpenAI-compat clients can talk to it directly.
 
+The facade is intentionally selective, not full public `/v1` parity. Route and
+state semantics are documented in `docs/openai-compatibility.md`.
+
+## Compatibility Model
+
+This proxy keeps a stable public facade while translating requests through a
+concrete Codex adapter modeled after LiteLLM's ChatGPT/Codex strategy:
+
+- requests are normalized into the ChatGPT Codex upstream shape
+- upstream calls are always opened as SSE
+- `store=false` and `stream=true` are enforced upstream
+- `reasoning.encrypted_content` is always requested upstream
+- a hard upstream allowlist is applied after normalization
+
+Important scope boundaries:
+
+- `/v1/files*` is proxy-local durable state
+- `/v1/models*` is proxy-generated state
+- `/v1/responses/ws` is proxy-local ephemeral continuation state
+- `/v1/responses` and `/v1/chat/completions` are stateless emulation over
+  Codex SSE
+- response lifecycle routes such as `GET /v1/responses/{id}` are intentionally
+  not claimed unless durable semantics can be provided truthfully
+
 ## Deploy (Docker)
 
 1. `mkdir -p ~/docker-apps/codex-proxy && cd ~/docker-apps/codex-proxy`
