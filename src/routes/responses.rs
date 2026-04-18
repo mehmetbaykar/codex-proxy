@@ -1208,8 +1208,11 @@ mod tests {
             "input":[{"role":"user","content":[{"type":"input_text","text":"again"}]}]
         });
 
-        let prepared = super::prepare_ws_request(&session_state, request, "response.append")
-            .expect("append should prepare successfully");
+        let Ok(prepared) =
+            super::prepare_ws_request(&session_state, request, "response.append")
+        else {
+            panic!("append should prepare successfully");
+        };
 
         assert_eq!(prepared["model"], json!("gpt-5.4"));
         assert_eq!(prepared["instructions"], json!("Keep it terse"));

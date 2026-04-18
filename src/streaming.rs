@@ -496,8 +496,11 @@ mod tests {
             "type": "response.content_part.added",
             "part": {"type": "refusal", "refusal": "I can't do that."}
         });
-        let line = map_response_event_to_chat_chunk(&event, &mut tool_state, "cmp-1", 1, "gpt-5.4")
-            .expect("refusal content_part should yield a chunk");
+        let Some(line) =
+            map_response_event_to_chat_chunk(&event, &mut tool_state, "cmp-1", 1, "gpt-5.4")
+        else {
+            panic!("refusal content_part should yield a chunk");
+        };
         assert!(
             line.contains("\"refusal\":\"I can't do that.\""),
             "chunk missing refusal delta: {line}"

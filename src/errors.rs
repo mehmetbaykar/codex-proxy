@@ -63,9 +63,11 @@ pub(crate) fn impossible_upstream_route_error(path: &str) -> Response {
 }
 
 /// Normalize an upstream error body to the official OpenAI envelope shape.
+///
 /// The ChatGPT/Codex backend ships two incompatible error shapes:
 ///   * FastAPI default: `{"detail":"Unsupported parameter: X"}`
 ///   * OpenAI structured: `{"error":{"message","type","code","param"}}`
+///
 /// Clients using the OpenAI SDK only parse the second form; the first becomes
 /// an opaque string. Translate `detail` into the canonical shape so typed
 /// exceptions work end-to-end.
@@ -149,16 +151,17 @@ pub(crate) fn upstream_open_error_response(err: &anyhow::Error) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
     use axum::body::to_bytes;
     use axum::http::StatusCode;
 
     #[test]
-    fn detail_shape_error_translated_to_openai_envelope() {
+    fn detail_shape_error_translated_to_openai_envelope() -> Result<()> {
         let out = normalize_upstream_error_body(
             r#"{"detail":"Unsupported parameter: temperature"}"#,
             StatusCode::BAD_REQUEST,
         );
-        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let parsed: Value = serde_json::from_str(&out)?;
         assert_eq!(
             parsed["error"]["message"],
             json!("Unsupported parameter: temperature")
@@ -166,6 +169,7 @@ mod tests {
         assert_eq!(parsed["error"]["type"], json!("invalid_request_error"));
         assert!(parsed["error"].get("code").is_some(), "code key must be present (null ok)");
         assert!(parsed["error"].get("param").is_some(), "param key must be present (null ok)");
+        Ok(())
     }
 
     #[test]
@@ -176,25 +180,26 @@ mod tests {
     }
 
     #[test]
-    fn non_json_body_wrapped_as_message() {
+    fn non_json_body_wrapped_as_message() -> Result<()> {
         let out = normalize_upstream_error_body(
             "Cloudflare blocked the request",
             StatusCode::SERVICE_UNAVAILABLE,
         );
-        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let parsed: Value = serde_json::from_str(&out)?;
         assert_eq!(
             parsed["error"]["message"],
             json!("Cloudflare blocked the request")
         );
         assert_eq!(parsed["error"]["type"], json!("server_error"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn proxy_error_envelope_includes_code_and_param_when_set() {
+    async fn proxy_error_envelope_includes_code_and_param_when_set() -> Result<()> {
         let response = unsupported_proxy_route_error("/v1/embeddings");
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let parsed: Value = serde_json::from_slice(&body)?;
         assert_eq!(parsed["error"]["type"], json!("unsupported_route_error"));
         assert_eq!(parsed["error"]["code"], json!("unsupported_route"));
         // `param` should be absent when None (serde_skip_serializing_if = Option::is_none)
@@ -203,5 +208,6 @@ mod tests {
                 || parsed["error"]["param"] == Value::Null,
             "param should be absent when None"
         );
+        Ok(())
     }
 }

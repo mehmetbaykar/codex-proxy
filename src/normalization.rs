@@ -1024,7 +1024,9 @@ mod tests {
             .await
             .map_err(|_| anyhow::anyhow!("normalization failed"))?;
 
-        let include = payload["include"].as_array().unwrap();
+        let include = payload["include"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("include should be an array"))?;
         assert!(include
             .iter()
             .all(|v| v.as_str() != Some("reasoning.summary")));
@@ -1151,7 +1153,7 @@ mod tests {
     }
 
     #[test]
-    fn include_filters_to_supported_values() {
+    fn include_filters_to_supported_values() -> Result<()> {
         let mut payload = serde_json::Map::new();
         payload.insert(
             "include".to_string(),
@@ -1163,16 +1165,19 @@ mod tests {
             ]),
         );
         super::sanitize_include_values(&mut payload);
-        let include = payload["include"].as_array().expect("array");
+        let include = payload["include"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("include should be an array"))?;
         let strings: Vec<&str> = include.iter().filter_map(Value::as_str).collect();
         assert!(strings.contains(&"reasoning.encrypted_content"));
         assert!(strings.contains(&"web_search_call.action.sources"));
         assert!(!strings.contains(&"reasoning.summary"));
         assert!(!strings.contains(&"usage"));
+        Ok(())
     }
 
     #[test]
-    fn tools_filters_to_supported_types() {
+    fn tools_filters_to_supported_types() -> Result<()> {
         let mut payload = serde_json::Map::new();
         payload.insert(
             "tools".to_string(),
@@ -1186,13 +1191,15 @@ mod tests {
             ]),
         );
         super::sanitize_tool_types(&mut payload);
-        let types: Vec<&str> = payload["tools"]
+        let tools = payload["tools"]
             .as_array()
-            .unwrap()
+            .ok_or_else(|| anyhow::anyhow!("tools should be an array"))?;
+        let types: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("type").and_then(Value::as_str))
             .collect();
         assert_eq!(types, vec!["function", "web_search", "image_generation"]);
+        Ok(())
     }
 
     #[test]
@@ -1213,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    fn web_search_options_no_op_when_tool_already_present() {
+    fn web_search_options_no_op_when_tool_already_present() -> Result<()> {
         let mut payload = serde_json::Map::new();
         payload.insert(
             "tools".to_string(),
@@ -1225,7 +1232,11 @@ mod tests {
         );
         super::map_web_search_options_to_tool(&mut payload);
         assert!(!payload.contains_key("web_search_options"));
-        assert_eq!(payload["tools"].as_array().unwrap().len(), 1);
+        let tools = payload["tools"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("tools should be an array"))?;
+        assert_eq!(tools.len(), 1);
+        Ok(())
     }
 
     #[test]
