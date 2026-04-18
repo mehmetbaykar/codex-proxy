@@ -5,8 +5,6 @@ OpenAI-compatible proxy in front of the ChatGPT-backed Codex upstream
 `/v1/responses`, `/v1/responses/ws`, `/v1/files*`, and `/v1/models` so Cursor
 and other OpenAI-compat clients can talk to it directly.
 
-Spec: [SPEC.md](SPEC.md).
-
 ## Deploy (Docker)
 
 1. `mkdir -p ~/docker-apps/codex-proxy && cd ~/docker-apps/codex-proxy`
