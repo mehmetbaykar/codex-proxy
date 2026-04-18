@@ -10,6 +10,10 @@ pub(crate) struct ErrorBody {
     pub(crate) message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) r#type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) param: Option<String>,
 }
 
 #[derive(Serialize)]

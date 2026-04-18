@@ -397,7 +397,13 @@ async fn aggregate_responses(
                         if let Some(failure) = upstream_terminal_error_response(&value) {
                             return failure;
                         }
-                        if value.get("type").and_then(Value::as_str) == Some("response.completed") {
+                        // `response.incomplete` is a valid terminal (e.g. hit max_output_tokens
+                        // or safety cutoff). Upstream carries the partial response object with
+                        // `status:"incomplete"` + `incomplete_details`; return it instead of 502.
+                        if matches!(
+                            value.get("type").and_then(Value::as_str),
+                            Some("response.completed") | Some("response.incomplete")
+                        ) {
                             if let Some(response) = value.get("response") {
                                 let response_completed_ms =
                                     aggregate_started_at.elapsed().as_secs_f64() * 1000.0;
@@ -553,7 +559,10 @@ async fn stream_chat_chunks(
                                 return;
                             }
 
-                            if value.get("type").and_then(Value::as_str) == Some("response.completed") {
+                            if matches!(
+                                value.get("type").and_then(Value::as_str),
+                                Some("response.completed") | Some("response.incomplete")
+                            ) {
                                 saw_done = true;
                                 let finish_reason = chat_completion_finish_reason(value.get("response"));
                                 let usage = value
@@ -569,11 +578,7 @@ async fn stream_chat_chunks(
                                     "choices":[{"index":0,"delta":{},"finish_reason":finish_reason}],
                                 });
                                 if client_options.include_usage {
-                                    final_chunk["usage"] = json!({
-                                        "prompt_tokens":usage.get("input_tokens").and_then(Value::as_i64).unwrap_or(0),
-                                        "completion_tokens":usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(0),
-                                        "total_tokens":usage.get("total_tokens").and_then(Value::as_i64).unwrap_or(0),
-                                    });
+                                    final_chunk["usage"] = build_chat_usage(&usage);
                                 }
                                 yield Ok(Bytes::from(format!("data: {final_chunk}\n\n")));
                                 yield Ok(Bytes::from("data: [DONE]\n\n".to_string()));
@@ -606,7 +611,7 @@ async fn aggregate_chat_completion(
     request_context: Option<&RequestContext>,
     headers: &HeaderMap,
     payload: &Value,
-    client_options: ClientStreamOptions,
+    _client_options: ClientStreamOptions, // include_usage is stream-only per OpenAI spec; non-stream always returns usage
 ) -> Response {
     let (mut stream, success_headers) = match state
         .codex_adapter
@@ -663,7 +668,7 @@ async fn aggregate_chat_completion(
     };
     let usage = response.get("usage").cloned().unwrap_or_else(|| json!({}));
     let finish_reason = chat_completion_finish_reason(Some(&response));
-    let mut completion = json!({
+    let completion = json!({
         "id": format!("chatcmpl-{}", Uuid::new_v4().simple()),
         "object":"chat.completion",
         "created": created,
@@ -673,17 +678,8 @@ async fn aggregate_chat_completion(
             "message":state.codex_adapter.response_to_chat_message(response.get("output")),
             "finish_reason":finish_reason
         }],
-        "usage":{
-            "prompt_tokens":usage.get("input_tokens").and_then(Value::as_i64).unwrap_or(0),
-            "completion_tokens":usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(0),
-            "total_tokens":usage.get("total_tokens").and_then(Value::as_i64).unwrap_or(0),
-        }
+        "usage": build_chat_usage(&usage),
     });
-    if !client_options.include_usage {
-        completion
-            .as_object_mut()
-            .map(|object| object.remove("usage"));
-    }
     let mut downstream = Json(completion).into_response();
     downstream.headers_mut().extend(success_headers);
     downstream
@@ -750,6 +746,28 @@ fn chat_terminal_error_chunk(
 ) -> Option<String> {
     terminal_error_message(event)
         .map(|message| chat_stream_error_chunk(chunk_id, created, model, &message))
+}
+
+/// Build an OpenAI-shaped chat `usage` from the upstream Responses-API usage,
+/// preserving `prompt_tokens_details.cached_tokens` and
+/// `completion_tokens_details.reasoning_tokens` (both documented on
+/// chat.completion per the OpenAI spec) so clients that rely on them keep working.
+fn build_chat_usage(usage: &Value) -> Value {
+    let prompt_tokens = usage.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
+    let completion_tokens = usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
+    let total_tokens = usage.get("total_tokens").and_then(Value::as_i64).unwrap_or(0);
+    let mut out = json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    });
+    if let Some(details) = usage.get("input_tokens_details").cloned() {
+        out["prompt_tokens_details"] = details;
+    }
+    if let Some(details) = usage.get("output_tokens_details").cloned() {
+        out["completion_tokens_details"] = details;
+    }
+    out
 }
 
 fn chat_completion_finish_reason(response: Option<&Value>) -> &'static str {
@@ -1196,5 +1214,109 @@ mod tests {
         assert_eq!(prepared["model"], json!("gpt-5.4"));
         assert_eq!(prepared["instructions"], json!("Keep it terse"));
         assert_eq!(prepared["input"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[tokio::test]
+    async fn non_streaming_responses_route_returns_incomplete_terminal_as_response_object() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/backend-api/codex/responses", post(mock_upstream_incomplete));
+            axum::serve(listener, app).await.ok();
+        });
+
+        let state = test_state(format!("http://{addr}/backend-api/codex/responses")).await?;
+        let app = build_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"model":"gpt-5.4","input":"hello","stream":false}).to_string(),
+            ))?;
+
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let json: Value = serde_json::from_slice(&body)?;
+        assert_eq!(json["status"], json!("incomplete"));
+        assert_eq!(
+            json["incomplete_details"]["reason"],
+            json!("max_output_tokens")
+        );
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_stream_chat_always_returns_usage_with_token_details() -> Result<()> {
+        async fn mock() -> Response {
+            let body = json!({
+                "type":"response.completed",
+                "response":{
+                    "status":"completed",
+                    "output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],
+                    "usage":{
+                        "input_tokens":10,
+                        "input_tokens_details":{"cached_tokens":3},
+                        "output_tokens":5,
+                        "output_tokens_details":{"reasoning_tokens":2},
+                        "total_tokens":15
+                    }
+                }
+            });
+            let stream = async_stream::stream! {
+                yield Ok::<Bytes, Infallible>(Bytes::from(format!("data: {body}\n\n")));
+                yield Ok::<Bytes, Infallible>(Bytes::from("data: [DONE]\n\n"));
+            };
+            let mut response = Response::new(Body::from_stream(stream));
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            response
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let app = Router::new().route("/backend-api/codex/responses", post(mock));
+            axum::serve(listener, app).await.ok();
+        });
+
+        let state = test_state(format!("http://{addr}/backend-api/codex/responses")).await?;
+        let app = build_router(state);
+        // stream_options.include_usage=false should NOT strip usage on a non-stream response
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"gpt-5.4",
+                    "messages":[{"role":"user","content":"hello"}],
+                    "stream":false,
+                    "stream_options":{"include_usage":false}
+                })
+                .to_string(),
+            ))?;
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let json: Value = serde_json::from_slice(&body)?;
+        assert_eq!(json["usage"]["prompt_tokens"], json!(10));
+        assert_eq!(json["usage"]["completion_tokens"], json!(5));
+        assert_eq!(json["usage"]["total_tokens"], json!(15));
+        assert_eq!(
+            json["usage"]["prompt_tokens_details"]["cached_tokens"],
+            json!(3)
+        );
+        assert_eq!(
+            json["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            json!(2)
+        );
+
+        server.abort();
+        Ok(())
     }
 }

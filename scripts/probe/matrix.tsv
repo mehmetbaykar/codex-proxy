@@ -1,0 +1,71 @@
+# field	status	verdict	param	code	message
+# derived 2026-04-18 against gpt-5.4 via scripts/probe/probe.sh
+audio	400	reject	-	-	Unsupported parameter: audio
+background	400	reject	-	-	Unsupported parameter: background
+baseline	200	accept	-	-	-
+context_management	400	reject	context_management	invalid_type	Invalid type for 'context_management': expected an array of objects, but got an object instead.
+conversation	400	reject	-	-	Unsupported parameter: conversation
+frequency_penalty	400	reject	-	-	Unsupported parameter: frequency_penalty
+include_filesearch	200	accept	-	-	-
+include_summary	400	reject	include[1]	invalid_value	Invalid value: 'reasoning.summary'. Supported values are: 'file_search_call.results', 'web_search_call.results', 'web_search_call.action.sources', 'message.input_image.image_url', 
+include_usage	400	reject	include[1]	invalid_value	Invalid value: 'usage'. Supported values are: 'file_search_call.results', 'web_search_call.results', 'web_search_call.action.sources', 'message.input_image.image_url', 'computer_ca
+include_websources	200	accept	-	-	-
+logprobs	400	reject	-	-	Unsupported parameter: logprobs
+max_completion_tokens	400	reject	-	-	Unsupported parameter: max_completion_tokens
+max_output_tokens	400	reject	-	-	Unsupported parameter: max_output_tokens
+max_tokens	400	reject	-	-	Unsupported parameter: max_tokens
+max_tool_calls	400	reject	-	-	Unsupported parameter: max_tool_calls
+metadata	400	reject	-	-	Unsupported parameter: metadata
+modalities	400	reject	-	-	Unsupported parameter: modalities
+n	400	reject	-	-	Unsupported parameter: n
+parallel_tool_calls	200	accept	-	-	-
+presence_penalty	400	reject	-	-	Unsupported parameter: presence_penalty
+previous_response_id_fake	400	reject	-	-	Unsupported parameter: previous_response_id
+prompt_cache_key_long	200	accept	-	-	-
+prompt_cache_key_short	200	accept	-	-	-
+prompt_cache_retention	400	reject	-	-	Unsupported parameter: prompt_cache_retention
+reasoning_effort_legacy	400	reject	-	-	Unsupported parameter: reasoning_effort
+reasoning_high	200	accept	-	-	-
+reasoning_low	200	accept	-	-	-
+reasoning_medium	200	accept	-	-	-
+reasoning_minimal	400	reject	reasoning.effort	unsupported_value	Unsupported value: 'minimal' is not supported with the 'gpt-5.4' model. Supported values are: 'none', 'low', 'medium', 'high', and 'xhigh'.
+reasoning_summary_auto	200	accept	-	-	-
+reasoning_summary_concise	200	accept	-	-	-
+reasoning_summary_detailed	200	accept	-	-	-
+reasoning_xhigh	200	accept	-	-	-
+response_format_legacy	400	reject	-	-	Unsupported parameter: response_format
+safety_identifier	400	reject	-	-	Unsupported parameter: safety_identifier
+seed	400	reject	-	-	Unsupported parameter: seed
+service_tier_auto	400	reject	-	-	Unsupported service_tier: auto
+service_tier_bogus	400	reject	-	-	Unsupported service_tier: bogus
+service_tier_default	400	reject	-	-	Unsupported service_tier: default
+service_tier_flex	400	reject	-	-	Unsupported service_tier: flex
+service_tier_priority	200	accept	-	-	-
+service_tier_standard	400	reject	-	-	Unsupported service_tier: standard
+stop	400	reject	-	-	Unsupported parameter: stop
+stream_options	400	reject	-	-	Unsupported parameter: stream_options
+temperature	400	reject	-	-	Unsupported parameter: temperature
+text_json_object	400	reject	input	-	Response input messages must contain the word 'json' in some form to use 'text.format' of type 'json_object'.
+text_json_schema	400	reject	text.format.schema	invalid_json_schema	Invalid schema for response_format 't': In context=(), 'additionalProperties' is required to be supplied and to be false.
+text_text	200	accept	-	-	-
+tool_apply_patch	400	reject	-	-	Unsupported tool type: apply_patch
+tool_choice_auto	200	accept	-	-	-
+tool_choice_none	200	accept	-	-	-
+tool_choice_required	400	reject	tool_choice	-	Tool choice 'required' must be specified with 'tools' parameter.
+tool_code_interpreter	400	reject	-	-	Unsupported tool type: code_interpreter
+tool_computer_use	400	reject	-	-	Unsupported tool type: computer_use_preview
+tool_custom_unknown	400	reject	-	-	Unsupported tool type: my_custom_tool_xxx
+tool_file_search	400	reject	-	-	Unsupported tool type: file_search
+tool_function	200	accept	-	-	-
+tool_image_generation	200	accept	-	-	-
+tool_local_shell	400	reject	tools	-	Tool 'local_shell' is not supported with gpt-5.4.
+tool_mcp	400	reject	-	-	Unsupported tool type: mcp
+tool_shell	400	reject	-	-	Unsupported tool type: shell
+tool_web_search	200	accept	-	-	-
+tool_web_search_preview	400	reject	-	-	Unsupported tool type: web_search_preview
+top_logprobs	400	reject	-	-	Unsupported parameter: top_logprobs
+top_p	400	reject	-	-	Unsupported parameter: top_p
+truncation_auto	400	reject	-	-	Unsupported parameter: truncation
+truncation_disabled	400	reject	-	-	Unsupported parameter: truncation
+user	400	reject	-	-	Unsupported parameter: user
+web_search_options	400	reject	-	-	Unsupported parameter: web_search_options

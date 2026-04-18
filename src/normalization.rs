@@ -57,6 +57,9 @@ pub(crate) async fn normalize_responses_payload(
     object.insert("stream".to_string(), Value::Bool(true));
     ensure_instructions(object);
     ensure_reasoning_encrypted_content(object);
+    map_web_search_options_to_tool(object);
+    sanitize_include_values(object);
+    sanitize_tool_types(object);
     sanitize_upstream_payload(object);
     Ok(())
 }
@@ -114,6 +117,9 @@ pub(crate) async fn normalize_chat_payload(
     object.insert("stream".to_string(), Value::Bool(true));
     ensure_instructions(object);
     ensure_reasoning_encrypted_content(object);
+    map_web_search_options_to_tool(object);
+    sanitize_include_values(object);
+    sanitize_tool_types(object);
     sanitize_upstream_payload(object);
     Ok(client_options)
 }
@@ -508,6 +514,12 @@ pub(crate) fn promote_instruction_items(object: &mut serde_json::Map<String, Val
 }
 
 fn is_allowed_upstream_field(key: &str) -> bool {
+    // Derived empirically via scripts/probe/probe.sh (see scripts/probe/matrix.tsv,
+    // 2026-04-18 vs gpt-5.4). Every key here was observed to pass backend validation;
+    // canonical OpenAI fields not listed (temperature, top_p, truncation, max_*_tokens,
+    // n, seed, stop, logprobs, user, safety_identifier, metadata, stream_options,
+    // frequency_penalty, presence_penalty, modalities, audio, background, ...) return
+    // `400 {"detail":"Unsupported parameter: X"}` from chatgpt.com/backend-api/codex.
     matches!(
         key,
         "model"
@@ -519,13 +531,10 @@ fn is_allowed_upstream_field(key: &str) -> bool {
             | "include"
             | "stream"
             | "reasoning"
-            | "temperature"
-            | "top_p"
-            | "max_output_tokens"
-            | "truncation"
             | "text"
             | "parallel_tool_calls"
             | "previous_response_id"
+            | "prompt_cache_key"
             | "service_tier"
     )
 }
@@ -605,10 +614,150 @@ pub(crate) fn map_openai_compat_fields(object: &mut serde_json::Map<String, Valu
             }
         }
     }
-    if object.get("text").is_none() {
-        if let Some(value) = object.remove("response_format") {
-            object.insert("text".to_string(), json!({"format": value}));
+    // `reasoning.effort: "minimal"` is canonical OpenAI for gpt-5/o-series but
+    // the ChatGPT/Codex backend rejects it with
+    // `unsupported_value: supported are 'none','low','medium','high','xhigh'`.
+    // Clamp to "low" so clients on the modern spec don't hit a 400.
+    if let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut)
+        && reasoning.get("effort").and_then(Value::as_str) == Some("minimal")
+    {
+        reasoning.insert("effort".to_string(), Value::String("low".to_string()));
+        tracing::debug!("clamped reasoning.effort from 'minimal' to 'low' (not supported upstream)");
+    }
+    // Only `text.format.type == "text"` is accepted by the backend. Both
+    // `json_object` and `json_schema` (and the legacy `response_format` field
+    // carrying those) cause 400. Drop silently so canonical OpenAI structured-
+    // output requests degrade to plain text rather than erroring.
+    if let Some(value) = object.remove("response_format") {
+        let kind = value
+            .as_object()
+            .and_then(|inner| inner.get("type"))
+            .and_then(Value::as_str);
+        match kind {
+            Some("text") => {
+                if object.get("text").is_none() {
+                    object.insert("text".to_string(), json!({"format": {"type": "text"}}));
+                }
+            }
+            Some(other) => {
+                tracing::debug!(
+                    "dropped response_format.type='{other}' (upstream only accepts 'text')"
+                );
+            }
+            None => {
+                tracing::debug!("dropped response_format (no type field)");
+            }
         }
+    }
+    if let Some(text) = object.get_mut("text").and_then(Value::as_object_mut) {
+        let format_kind = text
+            .get("format")
+            .and_then(|format| format.get("type"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        if let Some(kind) = format_kind
+            && kind != "text"
+        {
+            tracing::debug!(
+                "dropped text.format.type='{kind}' (upstream only accepts 'text')"
+            );
+            text.remove("format");
+        }
+        if text.is_empty() {
+            object.remove("text");
+        }
+    }
+}
+
+/// Filter `include` array to the value set the ChatGPT/Codex backend accepts.
+/// Anything else yields `400 invalid_value`.
+pub(crate) fn sanitize_include_values(object: &mut serde_json::Map<String, Value>) {
+    const SUPPORTED: &[&str] = &[
+        "reasoning.encrypted_content",
+        "file_search_call.results",
+        "web_search_call.results",
+        "web_search_call.action.sources",
+        "message.input_image.image_url",
+        "computer_call_output.output.image_url",
+        "code_interpreter_call.outputs",
+        "message.output_text.logprobs",
+    ];
+    let Some(include) = object.get_mut("include").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut dropped = Vec::<String>::new();
+    include.retain(|value| match value.as_str() {
+        Some(s) if SUPPORTED.contains(&s) => true,
+        Some(other) => {
+            dropped.push(other.to_string());
+            false
+        }
+        None => {
+            dropped.push(value.to_string());
+            false
+        }
+    });
+    if !dropped.is_empty() {
+        tracing::debug!("dropped unsupported include values: {:?}", dropped);
+    }
+}
+
+/// Filter `tools[].type` to the set gpt-5.4 accepts. Other types 400 with
+/// `Tool 'X' is not supported`. Keeps custom function tools (`type:"function"`).
+pub(crate) fn sanitize_tool_types(object: &mut serde_json::Map<String, Value>) {
+    const SUPPORTED: &[&str] = &["function", "web_search", "image_generation"];
+    let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut dropped = Vec::<String>::new();
+    tools.retain(|tool| {
+        let kind = tool.get("type").and_then(Value::as_str).unwrap_or("");
+        if SUPPORTED.contains(&kind) {
+            true
+        } else {
+            dropped.push(kind.to_string());
+            false
+        }
+    });
+    if !dropped.is_empty() {
+        tracing::debug!("dropped unsupported tool types: {:?}", dropped);
+    }
+    if tools.is_empty() {
+        object.remove("tools");
+    }
+}
+
+/// Canonical OpenAI spec has a top-level `web_search_options` field; upstream
+/// rejects it as `Unsupported parameter` but DOES accept `{type:"web_search"}`
+/// in the `tools` array. Migrate the field into a tool and drop the original.
+pub(crate) fn map_web_search_options_to_tool(object: &mut serde_json::Map<String, Value>) {
+    let Some(options) = object.remove("web_search_options") else {
+        return;
+    };
+    let already_present = object
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.get("type").and_then(Value::as_str) == Some("web_search"))
+        });
+    if already_present {
+        tracing::debug!("dropped redundant web_search_options (tools already has web_search)");
+        return;
+    }
+    let mut tool = serde_json::Map::new();
+    tool.insert("type".to_string(), Value::String("web_search".to_string()));
+    if let Some(obj) = options.as_object() {
+        for (key, value) in obj {
+            if matches!(key.as_str(), "search_context_size" | "user_location") {
+                tool.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    let tools = object.entry("tools".to_string()).or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(arr) = tools.as_array_mut() {
+        arr.push(Value::Object(tool));
     }
 }
 
@@ -701,6 +850,7 @@ mod tests {
         let mut payload = serde_json::Map::new();
         payload.insert("max_completion_tokens".to_string(), json!(321));
         payload.insert("reasoning_effort".to_string(), json!("high"));
+        // json_schema is canonical OpenAI but backend 400s -> we drop silently
         payload.insert("response_format".to_string(), json!({"type":"json_schema"}));
 
         map_openai_compat_fields(&mut payload);
@@ -710,7 +860,8 @@ mod tests {
         assert_eq!(payload.get("reasoning"), Some(&json!({"effort":"high"})));
         assert_eq!(
             payload.get("text"),
-            Some(&json!({"format":{"type":"json_schema"}}))
+            None,
+            "json_schema response_format must be dropped, not forwarded"
         );
     }
 
@@ -756,20 +907,40 @@ mod tests {
     #[test]
     fn sanitize_drops_fields_rejected_by_chatgpt_backend() {
         // Upstream chatgpt.com/backend-api/codex/responses returns
-        // `400 Unsupported parameter: <name>` for these fields even though
-        // Cursor emits them per OpenAI Chat Completions canonical spec.
-        // Confirmed by live replay 2026-04-17.
+        // `400 {"detail":"Unsupported parameter: <name>"}` for these fields even
+        // though Cursor emits them per OpenAI Chat Completions canonical spec.
+        // Confirmed by scripts/probe/probe.sh (see scripts/probe/matrix.tsv) 2026-04-18.
         let mut payload = serde_json::Map::new();
         payload.insert("model".to_string(), json!("gpt-5.4"));
         payload.insert("metadata".to_string(), json!({"workspace":"test"}));
         payload.insert("prompt_cache_retention".to_string(), json!("24h"));
-        payload.insert("prompt_cache_key".to_string(), json!("cursor-session-42"));
+        payload.insert("temperature".to_string(), json!(0.7));
+        payload.insert("top_p".to_string(), json!(0.9));
+        payload.insert("truncation".to_string(), json!("auto"));
+        payload.insert("max_output_tokens".to_string(), json!(128));
 
         super::sanitize_upstream_payload(&mut payload);
 
         assert!(!payload.contains_key("metadata"));
         assert!(!payload.contains_key("prompt_cache_retention"));
-        assert!(!payload.contains_key("prompt_cache_key"));
+        assert!(!payload.contains_key("temperature"));
+        assert!(!payload.contains_key("top_p"));
+        assert!(!payload.contains_key("truncation"));
+        assert!(!payload.contains_key("max_output_tokens"));
+    }
+
+    #[test]
+    fn sanitize_keeps_prompt_cache_key() {
+        // Backend accepts `prompt_cache_key` (any reasonable length; internal
+        // cap is 64 chars shared with the session_id header). Confirmed via
+        // scripts/probe/probe.sh — earlier assumption it 400s was wrong.
+        let mut payload = serde_json::Map::new();
+        payload.insert("model".to_string(), json!("gpt-5.4"));
+        payload.insert("prompt_cache_key".to_string(), json!("cursor-session-42"));
+
+        super::sanitize_upstream_payload(&mut payload);
+
+        assert_eq!(payload.get("prompt_cache_key"), Some(&json!("cursor-session-42")));
     }
 
     #[tokio::test]
@@ -808,10 +979,12 @@ mod tests {
     #[tokio::test]
     async fn normalization_always_requests_reasoning_encrypted_content() -> Result<()> {
         let state = test_state(String::new()).await?;
+        // Seed with a backend-accepted include value; `reasoning.encrypted_content`
+        // must be present after normalization regardless of what the client sent.
         let mut payload = json!({
             "model":"gpt-5.4",
             "input":"hello",
-            "include":["reasoning.summary"]
+            "include":["web_search_call.action.sources"]
         });
 
         normalize_responses_payload(&state, &mut payload)
@@ -821,12 +994,41 @@ mod tests {
         let include = payload["include"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("include should be an array"))?;
+        assert!(
+            include
+                .iter()
+                .any(|value| value.as_str() == Some("reasoning.encrypted_content")),
+            "reasoning.encrypted_content must always be present"
+        );
+        assert!(
+            include
+                .iter()
+                .any(|value| value.as_str() == Some("web_search_call.action.sources")),
+            "client-supplied (accepted) include values must survive sanitization"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn normalization_drops_backend_rejected_include_values() -> Result<()> {
+        // Backend returns `400 invalid_value` for `reasoning.summary` and `usage`
+        // (not in the 8-value supported set). Probe: matrix.tsv.
+        let state = test_state(String::new()).await?;
+        let mut payload = json!({
+            "model":"gpt-5.4",
+            "input":"hello",
+            "include":["reasoning.summary","usage"]
+        });
+
+        normalize_responses_payload(&state, &mut payload)
+            .await
+            .map_err(|_| anyhow::anyhow!("normalization failed"))?;
+
+        let include = payload["include"].as_array().unwrap();
         assert!(include
             .iter()
-            .any(|value| value.as_str() == Some("reasoning.encrypted_content")));
-        assert!(include
-            .iter()
-            .any(|value| value.as_str() == Some("reasoning.summary")));
+            .all(|v| v.as_str() != Some("reasoning.summary")));
+        assert!(include.iter().all(|v| v.as_str() != Some("usage")));
         Ok(())
     }
 
@@ -912,5 +1114,185 @@ mod tests {
         assert_eq!(payload["input"][0]["content"][0]["image_url"], json!("https://example.com/a.png"));
         assert_eq!(payload["input"][0]["content"][0]["detail"], json!("high"));
         Ok(())
+    }
+
+    #[test]
+    fn response_format_json_object_is_dropped() {
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "response_format".to_string(),
+            json!({"type":"json_object"}),
+        );
+        map_openai_compat_fields(&mut payload);
+        assert!(
+            !payload.contains_key("response_format"),
+            "response_format must not survive the mapping pass"
+        );
+        assert!(
+            !payload.contains_key("text"),
+            "json_object must not be forwarded as text.format — backend 400s"
+        );
+    }
+
+    #[test]
+    fn response_format_text_becomes_text_format() {
+        let mut payload = serde_json::Map::new();
+        payload.insert("response_format".to_string(), json!({"type":"text"}));
+        map_openai_compat_fields(&mut payload);
+        assert_eq!(payload.get("text"), Some(&json!({"format":{"type":"text"}})));
+    }
+
+    #[test]
+    fn reasoning_minimal_clamped_to_low() {
+        let mut payload = serde_json::Map::new();
+        payload.insert("reasoning".to_string(), json!({"effort":"minimal"}));
+        map_openai_compat_fields(&mut payload);
+        assert_eq!(payload.get("reasoning"), Some(&json!({"effort":"low"})));
+    }
+
+    #[test]
+    fn include_filters_to_supported_values() {
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "include".to_string(),
+            json!([
+                "reasoning.encrypted_content",
+                "reasoning.summary",
+                "usage",
+                "web_search_call.action.sources"
+            ]),
+        );
+        super::sanitize_include_values(&mut payload);
+        let include = payload["include"].as_array().expect("array");
+        let strings: Vec<&str> = include.iter().filter_map(Value::as_str).collect();
+        assert!(strings.contains(&"reasoning.encrypted_content"));
+        assert!(strings.contains(&"web_search_call.action.sources"));
+        assert!(!strings.contains(&"reasoning.summary"));
+        assert!(!strings.contains(&"usage"));
+    }
+
+    #[test]
+    fn tools_filters_to_supported_types() {
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "tools".to_string(),
+            json!([
+                {"type":"function","name":"lookup","parameters":{"type":"object"}},
+                {"type":"file_search"},
+                {"type":"code_interpreter"},
+                {"type":"web_search"},
+                {"type":"image_generation"},
+                {"type":"apply_patch"}
+            ]),
+        );
+        super::sanitize_tool_types(&mut payload);
+        let types: Vec<&str> = payload["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("type").and_then(Value::as_str))
+            .collect();
+        assert_eq!(types, vec!["function", "web_search", "image_generation"]);
+    }
+
+    #[test]
+    fn web_search_options_injects_web_search_tool_and_drops_original() {
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "web_search_options".to_string(),
+            json!({"search_context_size":"high"}),
+        );
+        super::map_web_search_options_to_tool(&mut payload);
+        assert!(
+            !payload.contains_key("web_search_options"),
+            "upstream 400s on web_search_options, must be dropped"
+        );
+        let tool = &payload["tools"][0];
+        assert_eq!(tool["type"], json!("web_search"));
+        assert_eq!(tool["search_context_size"], json!("high"));
+    }
+
+    #[test]
+    fn web_search_options_no_op_when_tool_already_present() {
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "tools".to_string(),
+            json!([{"type":"web_search","search_context_size":"low"}]),
+        );
+        payload.insert(
+            "web_search_options".to_string(),
+            json!({"search_context_size":"high"}),
+        );
+        super::map_web_search_options_to_tool(&mut payload);
+        assert!(!payload.contains_key("web_search_options"));
+        assert_eq!(payload["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn allowlist_matches_probe_matrix() {
+        // Invariant: every top-level field name appearing as `accept` in the
+        // committed probe matrix must survive `sanitize_upstream_payload`, and
+        // every `reject` row must be stripped. Regenerate via
+        // `CODEX_PROBE_TOKEN=... scripts/probe/probe.sh`.
+        let matrix = include_str!("../scripts/probe/matrix.tsv");
+        // Probe rows describe compound field states (e.g. "tool_function" with
+        // `tools:[...]`). This test focuses on the top-level field names we
+        // forward verbatim to upstream, so map each probe name → the JSON key
+        // we'd actually sanitize. Compound / value-specific probes are covered
+        // by dedicated tests elsewhere.
+        let top_level = |probe_name: &str| -> Option<&'static str> {
+            match probe_name {
+                "baseline" => None,
+                "temperature" => Some("temperature"),
+                "top_p" => Some("top_p"),
+                "max_output_tokens" => Some("max_output_tokens"),
+                "max_tokens" => Some("max_tokens"),
+                "max_completion_tokens" => Some("max_completion_tokens"),
+                "n" => Some("n"),
+                "seed" => Some("seed"),
+                "stop" => Some("stop"),
+                "logprobs" => Some("logprobs"),
+                "top_logprobs" => Some("top_logprobs"),
+                "user" => Some("user"),
+                "safety_identifier" => Some("safety_identifier"),
+                "metadata" => Some("metadata"),
+                "prompt_cache_key_short" | "prompt_cache_key_long" => Some("prompt_cache_key"),
+                "parallel_tool_calls" => Some("parallel_tool_calls"),
+                "truncation_auto" | "truncation_disabled" => Some("truncation"),
+                "background" => Some("background"),
+                "modalities" => Some("modalities"),
+                "audio" => Some("audio"),
+                "stream_options" => Some("stream_options"),
+                "prompt_cache_retention" => Some("prompt_cache_retention"),
+                "conversation" => Some("conversation"),
+                "frequency_penalty" => Some("frequency_penalty"),
+                "presence_penalty" => Some("presence_penalty"),
+                "max_tool_calls" => Some("max_tool_calls"),
+                "web_search_options" => Some("web_search_options"),
+                "context_management" => Some("context_management"),
+                _ => None, // value-specific / compound probes handled by other tests
+            }
+        };
+        for line in matrix.lines() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let mut fields = line.splitn(6, '\t');
+            let probe_name = fields.next().unwrap_or("");
+            let _status = fields.next().unwrap_or("");
+            let verdict = fields.next().unwrap_or("");
+            let Some(key) = top_level(probe_name) else { continue };
+            match verdict {
+                "accept" => assert!(
+                    super::is_allowed_upstream_field(key),
+                    "probe matrix says `{key}` accepts but allowlist drops it"
+                ),
+                "reject" => assert!(
+                    !super::is_allowed_upstream_field(key),
+                    "probe matrix says `{key}` rejects but allowlist forwards it"
+                ),
+                _ => {}
+            }
+        }
     }
 }
