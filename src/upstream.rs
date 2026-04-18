@@ -1,5 +1,6 @@
 use anyhow::Result;
 use axum::http::{
+    HeaderName,
     HeaderMap,
     header::{ACCEPT_ENCODING, CONTENT_TYPE, USER_AGENT},
 };
@@ -9,6 +10,63 @@ use serde_json::{Value, json};
 use crate::config::{CLIENT_REQUEST_ID_HEADER, REQUEST_ID_HEADER, UPSTREAM_LOG_FILE};
 use crate::logging::log_request_event;
 use crate::state::{AppState, RequestContext};
+
+pub(crate) const FORWARDED_SUCCESS_HEADERS: &[&str] = &[
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset-tokens",
+    "x-request-id",
+];
+
+pub(crate) async fn build_chatgpt_upstream_headers(
+    state: &AppState,
+    request_context: Option<&RequestContext>,
+    incoming_headers: &HeaderMap,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Some(account_id) = state.auth.current_account_id().await
+        && let Ok(value) = account_id.parse()
+    {
+        headers.insert("ChatGPT-Account-Id", value);
+    }
+    if let Some(context) = request_context {
+        if let Ok(value) = context.request_id.parse() {
+            headers.insert("session_id", value);
+        }
+        headers.insert("originator", axum::http::HeaderValue::from_static("codex-proxy"));
+        if let Ok(value) = axum::http::HeaderValue::from_str("codex-proxy/0.1") {
+            headers.insert(USER_AGENT, value);
+        }
+        if let Ok(value) = axum::http::HeaderValue::from_str(&context.request_id) {
+            headers.insert(REQUEST_ID_HEADER, value);
+        }
+        if let Some(client_request_id) = &context.client_request_id
+            && let Ok(value) = axum::http::HeaderValue::from_str(client_request_id)
+        {
+            headers.insert(CLIENT_REQUEST_ID_HEADER, value);
+        }
+    } else if let Some(value) = incoming_headers.get(REQUEST_ID_HEADER) {
+        headers.insert(REQUEST_ID_HEADER, value.clone());
+        headers.insert("session_id", value.clone());
+    }
+    headers
+}
+
+pub(crate) fn processed_success_headers(headers: &reqwest::header::HeaderMap) -> HeaderMap {
+    let mut forwarded = HeaderMap::new();
+    for (name, value) in headers {
+        let key = name.as_str().to_ascii_lowercase();
+        if FORWARDED_SUCCESS_HEADERS.contains(&key.as_str()) {
+            forwarded.insert(name.clone(), value.clone());
+        } else if let Ok(provider_name) = format!("llm_provider-{key}").parse::<HeaderName>() {
+            forwarded.insert(provider_name, value.clone());
+        }
+    }
+    forwarded
+}
 
 pub(crate) async fn open_upstream_response(
     state: &AppState,
@@ -49,6 +107,7 @@ async fn send_upstream(
     body: &Value,
     token: &str,
 ) -> Result<reqwest::Response> {
+    let chatgpt_headers = build_chatgpt_upstream_headers(state, request_context, incoming_headers).await;
     let mut request = state
         .client
         .post(&state.upstream_url)
@@ -60,13 +119,8 @@ async fn send_upstream(
     if state.upstream_identity_encoding {
         request = request.header(ACCEPT_ENCODING, "identity");
     }
-    if let Some(context) = request_context {
-        request = request.header(REQUEST_ID_HEADER, context.request_id.clone());
-        if let Some(client_request_id) = &context.client_request_id {
-            request = request.header(CLIENT_REQUEST_ID_HEADER, client_request_id.clone());
-        }
-    } else if let Some(value) = incoming_headers.get(REQUEST_ID_HEADER) {
-        request = request.header(REQUEST_ID_HEADER, value.clone());
+    for (name, value) in &chatgpt_headers {
+        request = request.header(name, value);
     }
     request.send().await.map_err(Into::into)
 }

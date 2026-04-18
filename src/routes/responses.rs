@@ -16,6 +16,7 @@ use crate::errors::{json_error, upstream_error_response, upstream_open_error_res
 use crate::logging::{log_json_request, log_request_event};
 use crate::state::{AppState, ClientStreamOptions, RequestContext, WsSessionState};
 use crate::streaming::{SseParser, ToolStreamState};
+use crate::upstream::processed_success_headers;
 
 pub(crate) async fn post_responses(
     State(state): State<AppState>,
@@ -311,20 +312,17 @@ async fn proxy_sse_passthrough(
     if !response.status().is_success() {
         return upstream_error_response(response).await;
     }
+    let success_headers = processed_success_headers(response.headers());
 
     let payload_stream = response.bytes_stream();
     let out = async_stream::stream! {
         let mut parser = SseParser::default();
-        let mut saw_done = false;
         futures::pin_mut!(payload_stream);
         while let Some(item) = payload_stream.next().await {
             match item {
                 Ok(chunk) => {
                     let text = String::from_utf8_lossy(&chunk);
                     for event in parser.feed(&text) {
-                        if event == "[DONE]" {
-                            saw_done = true;
-                        }
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("data: {event}\n\n")));
                     }
                 }
@@ -334,15 +332,13 @@ async fn proxy_sse_passthrough(
                 }
             }
         }
-        if !saw_done {
-            yield Ok::<Bytes, std::io::Error>(Bytes::from("data: [DONE]\n\n".to_string()));
-        }
     };
 
     let mut response = Response::new(Body::from_stream(out));
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().extend(success_headers);
     response
 }
 
@@ -355,7 +351,7 @@ async fn aggregate_responses(
 ) -> Response {
     let aggregate_started_at = Instant::now();
     let upstream_open_started_at = Instant::now();
-    let mut stream = match state
+    let (mut stream, success_headers) = match state
         .codex_adapter
         .open_upstream_response(state, request_context, headers, payload)
         .await
@@ -364,7 +360,11 @@ async fn aggregate_responses(
             if !response.status().is_success() {
                 return upstream_error_response(response).await;
             }
-            response.bytes_stream()
+            let success_headers = processed_success_headers(response.headers());
+            (
+                response.bytes_stream(),
+                success_headers,
+            )
         }
         Err(err) => return upstream_open_error_response(&err),
     };
@@ -394,6 +394,9 @@ async fn aggregate_responses(
                             Some(aggregate_started_at.elapsed().as_secs_f64() * 1000.0);
                     }
                     if let Ok(value) = serde_json::from_str::<Value>(&event) {
+                        if let Some(failure) = upstream_terminal_error_response(&value) {
+                            return failure;
+                        }
                         if value.get("type").and_then(Value::as_str) == Some("response.completed") {
                             if let Some(response) = value.get("response") {
                                 let response_completed_ms =
@@ -429,6 +432,7 @@ async fn aggregate_responses(
                                 .await;
                                 let mut downstream_response =
                                     Json(response.clone()).into_response();
+                                downstream_response.headers_mut().extend(success_headers.clone());
                                 if let Ok(header_value) = HeaderValue::from_str(&format!(
                                     "normalize={normalization_ms:.1}; open={upstream_open_ms:.1}; first_chunk={}; completed={response_completed_ms:.1}; total={end_to_end_ms:.1}",
                                     first_chunk_ms
@@ -496,6 +500,7 @@ async fn stream_chat_chunks(
     if !response.status().is_success() {
         return upstream_error_response(response).await;
     }
+    let success_headers = processed_success_headers(response.headers());
     let model = payload
         .get("model")
         .and_then(Value::as_str)
@@ -540,15 +545,17 @@ async fn stream_chat_chunks(
                                 yield Ok(Bytes::from(line));
                             }
 
+                            if let Some(error_chunk) =
+                                chat_terminal_error_chunk(&value, &chunk_id, created, &model)
+                            {
+                                yield Ok(Bytes::from(error_chunk));
+                                yield Ok(Bytes::from("data: [DONE]\n\n".to_string()));
+                                return;
+                            }
+
                             if value.get("type").and_then(Value::as_str) == Some("response.completed") {
                                 saw_done = true;
-                                let finish_reason = if adapter.response_output_indicates_tool_calls(
-                                    value.get("response"),
-                                ) {
-                                    "tool_calls"
-                                } else {
-                                    "stop"
-                                };
+                                let finish_reason = chat_completion_finish_reason(value.get("response"));
                                 let usage = value
                                     .get("response")
                                     .and_then(|response| response.get("usage"))
@@ -581,6 +588,7 @@ async fn stream_chat_chunks(
             }
         }
         if !saw_done {
+            yield Ok(Bytes::from(chat_stream_error_chunk(&chunk_id, created, &model, "Upstream stream terminated before response.completed")));
             yield Ok(Bytes::from("data: [DONE]\n\n".to_string()));
         }
     };
@@ -589,6 +597,7 @@ async fn stream_chat_chunks(
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().extend(success_headers);
     response
 }
 
@@ -599,7 +608,7 @@ async fn aggregate_chat_completion(
     payload: &Value,
     client_options: ClientStreamOptions,
 ) -> Response {
-    let mut stream = match state
+    let (mut stream, success_headers) = match state
         .codex_adapter
         .open_upstream_response(state, request_context, headers, payload)
         .await
@@ -608,7 +617,11 @@ async fn aggregate_chat_completion(
             if !response.status().is_success() {
                 return upstream_error_response(response).await;
             }
-            response.bytes_stream()
+            let success_headers = processed_success_headers(response.headers());
+            (
+                response.bytes_stream(),
+                success_headers,
+            )
         }
         Err(err) => return upstream_open_error_response(&err),
     };
@@ -628,7 +641,13 @@ async fn aggregate_chat_completion(
                     continue;
                 }
                 if let Ok(value) = serde_json::from_str::<Value>(&event) {
-                    if value.get("type").and_then(Value::as_str) == Some("response.completed") {
+                    if let Some(failure) = upstream_terminal_error_response(&value) {
+                        return failure;
+                    }
+                    if matches!(
+                        value.get("type").and_then(Value::as_str),
+                        Some("response.completed") | Some("response.incomplete")
+                    ) {
                         completed_response = value.get("response").cloned();
                     }
                 }
@@ -643,14 +662,7 @@ async fn aggregate_chat_completion(
         );
     };
     let usage = response.get("usage").cloned().unwrap_or_else(|| json!({}));
-    let finish_reason = if state
-        .codex_adapter
-        .response_output_indicates_tool_calls(Some(&response))
-    {
-        "tool_calls"
-    } else {
-        "stop"
-    };
+    let finish_reason = chat_completion_finish_reason(Some(&response));
     let mut completion = json!({
         "id": format!("chatcmpl-{}", Uuid::new_v4().simple()),
         "object":"chat.completion",
@@ -672,7 +684,119 @@ async fn aggregate_chat_completion(
             .as_object_mut()
             .map(|object| object.remove("usage"));
     }
-    Json(completion).into_response()
+    let mut downstream = Json(completion).into_response();
+    downstream.headers_mut().extend(success_headers);
+    downstream
+}
+
+fn terminal_error_message(event: &Value) -> Option<String> {
+    let event_type = event.get("type").and_then(Value::as_str)?;
+    if !matches!(
+        event_type,
+        "response.failed" | "error"
+    ) {
+        return None;
+    }
+    event.get("error")
+        .and_then(|value| value.get("message").or(Some(value)))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            event.get("response")
+                .and_then(|response| response.get("error"))
+                .and_then(|value| value.get("message").or(Some(value)))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            event.get("response")
+                .and_then(|response| response.get("incomplete_details"))
+                .map(|value| value.to_string())
+        })
+        .or_else(|| Some(format!("Upstream terminal event: {event_type}")))
+}
+
+fn upstream_terminal_error_response(event: &Value) -> Option<Response> {
+    terminal_error_message(event)
+        .map(|message| json_error(StatusCode::BAD_GATEWAY, &message))
+}
+
+fn chat_stream_error_chunk(chunk_id: &str, created: i64, model: &str, message: &str) -> String {
+    format!(
+        "data: {}\n\n",
+        json!({
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "error"
+            }],
+            "error": {
+                "message": message,
+                "type": "server_error"
+            }
+        })
+    )
+}
+
+fn chat_terminal_error_chunk(
+    event: &Value,
+    chunk_id: &str,
+    created: i64,
+    model: &str,
+) -> Option<String> {
+    terminal_error_message(event)
+        .map(|message| chat_stream_error_chunk(chunk_id, created, model, &message))
+}
+
+fn chat_completion_finish_reason(response: Option<&Value>) -> &'static str {
+    if response
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        == Some("incomplete")
+    {
+        return "length";
+    }
+    if response
+        .and_then(|value| value.get("output"))
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("message")
+                    && item
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                part.get("type").and_then(Value::as_str) == Some("refusal")
+                            })
+                        })
+            })
+        })
+    {
+        return "content_filter";
+    }
+    if response_output_has_tool_calls(response) {
+        return "tool_calls";
+    }
+    "stop"
+}
+
+fn response_output_has_tool_calls(response: Option<&Value>) -> bool {
+    response
+        .and_then(|value| value.get("output"))
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("function_call") | Some("custom_tool_call")
+                )
+            })
+        })
 }
 
 fn prepare_ws_request(
@@ -764,6 +888,7 @@ mod tests {
     use axum::Router;
     use axum::body::{Body, Bytes, to_bytes};
     use axum::http::{HeaderValue, Request, StatusCode, header::CONTENT_TYPE};
+    use axum::http::header::HeaderName;
     use axum::response::Response;
     use axum::routing::post;
     use serde_json::{Value, json};
@@ -779,6 +904,82 @@ mod tests {
             yield Ok::<Bytes, Infallible>(Bytes::from(
                 "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}],\"usage\":{\"input_tokens\":5,\"output_tokens\":7,\"total_tokens\":12}}}\n\n"
             ));
+            yield Ok::<Bytes, Infallible>(Bytes::from("data: [DONE]\n\n"));
+        };
+        let mut response = Response::new(Body::from_stream(stream));
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        response
+    }
+
+    async fn mock_upstream_with_headers() -> Response {
+        let mut response = mock_upstream().await;
+        response.headers_mut().insert(
+            HeaderName::from_static("x-ratelimit-remaining-requests"),
+            HeaderValue::from_static("42"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("x-request-id"),
+            HeaderValue::from_static("upstream-req-1"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("openai-processing-ms"),
+            HeaderValue::from_static("123"),
+        );
+        response
+    }
+
+    async fn mock_upstream_failed() -> Response {
+        let stream = async_stream::stream! {
+            yield Ok::<Bytes, Infallible>(Bytes::from(
+                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n"
+            ));
+            yield Ok::<Bytes, Infallible>(Bytes::from("data: [DONE]\n\n"));
+        };
+        let mut response = Response::new(Body::from_stream(stream));
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        response
+    }
+
+    async fn mock_upstream_incomplete() -> Response {
+        let stream = async_stream::stream! {
+            yield Ok::<Bytes, Infallible>(Bytes::from(
+                "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"blocked\"}]}],\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n"
+            ));
+            yield Ok::<Bytes, Infallible>(Bytes::from("data: [DONE]\n\n"));
+        };
+        let mut response = Response::new(Body::from_stream(stream));
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        response
+    }
+
+    async fn capture_upstream_headers(headers: axum::http::HeaderMap) -> Response {
+        let body = json!({
+            "type":"response.completed",
+            "response":{
+                "status":"completed",
+                "output":[{
+                    "type":"message",
+                    "content":[{
+                        "type":"output_text",
+                        "text": json!({
+                            "received_session_id": headers.get("session_id").and_then(|v| v.to_str().ok()),
+                            "received_account_id": headers.get("ChatGPT-Account-Id").and_then(|v| v.to_str().ok()),
+                            "received_request_id": headers.get("x-request-id").and_then(|v| v.to_str().ok()),
+                            "received_client_request_id": headers.get("x-client-request-id").and_then(|v| v.to_str().ok()),
+                        }).to_string()
+                    }]
+                }],
+                "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+            }
+        });
+        let stream = async_stream::stream! {
+            yield Ok::<Bytes, Infallible>(Bytes::from(format!("data: {body}\n\n")));
             yield Ok::<Bytes, Infallible>(Bytes::from("data: [DONE]\n\n"));
         };
         let mut response = Response::new(Body::from_stream(stream));
@@ -818,6 +1019,155 @@ mod tests {
         let json: Value = serde_json::from_slice(&body)?;
         assert_eq!(json["status"], json!("completed"));
         assert_eq!(json["usage"]["output_tokens"], json!(7));
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_streaming_responses_route_returns_failed_terminal_as_bad_gateway() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let app =
+                Router::new().route("/backend-api/codex/responses", post(mock_upstream_failed));
+            axum::serve(listener, app).await.ok();
+        });
+
+        let state = test_state(format!("http://{addr}/backend-api/codex/responses")).await?;
+        let app = build_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"gpt-5.4",
+                    "input":"hello",
+                    "stream":false
+                })
+                .to_string(),
+            ))?;
+
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let json: Value = serde_json::from_slice(&body)?;
+        assert_eq!(json["error"]["message"], json!("boom"));
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_streaming_chat_route_returns_incomplete_terminal_with_length_finish_reason() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let app =
+                Router::new().route("/backend-api/codex/responses", post(mock_upstream_incomplete));
+            axum::serve(listener, app).await.ok();
+        });
+
+        let state = test_state(format!("http://{addr}/backend-api/codex/responses")).await?;
+        let app = build_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"gpt-5.4",
+                    "messages":[{"role":"user","content":"hello"}],
+                    "stream":false
+                })
+                .to_string(),
+            ))?;
+
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let json: Value = serde_json::from_slice(&body)?;
+        assert_eq!(json["choices"][0]["finish_reason"], json!("length"));
+        assert_eq!(json["choices"][0]["message"]["refusal"], json!("blocked"));
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_converted_response_preserves_important_upstream_headers() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/backend-api/codex/responses", post(mock_upstream_with_headers));
+            axum::serve(listener, app).await.ok();
+        });
+
+        let state = test_state(format!("http://{addr}/backend-api/codex/responses")).await?;
+        let app = build_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"gpt-5.4",
+                    "input":"hello",
+                    "stream":false
+                })
+                .to_string(),
+            ))?;
+
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.headers()["x-ratelimit-remaining-requests"], "42");
+        assert_eq!(response.headers()["llm_provider-openai-processing-ms"], "123");
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upstream_request_includes_session_account_and_request_headers() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/backend-api/codex/responses", post(capture_upstream_headers));
+            axum::serve(listener, app).await.ok();
+        });
+
+        let state = test_state(format!("http://{addr}/backend-api/codex/responses")).await?;
+        let app = build_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-request-id", "proxy-req-123")
+            .header("x-client-request-id", "client-req-789")
+            .body(Body::from(
+                json!({
+                    "model":"gpt-5.4",
+                    "input":"hello",
+                    "stream":false
+                })
+                .to_string(),
+            ))?;
+
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let json: Value = serde_json::from_slice(&body)?;
+        let received: Value = serde_json::from_str(
+            json["output"][0]["content"][0]["text"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("expected output text"))?,
+        )?;
+        assert!(received["received_session_id"].as_str().is_some());
+        assert_eq!(received["received_account_id"], json!("acct-test"));
+        assert!(received["received_request_id"].as_str().is_some());
+        assert_eq!(received["received_client_request_id"], json!("client-req-789"));
 
         server.abort();
         Ok(())

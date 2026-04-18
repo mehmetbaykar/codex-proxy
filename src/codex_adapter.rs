@@ -7,8 +7,7 @@ use crate::files::now_unix;
 use crate::normalization::{normalize_chat_payload, normalize_responses_payload};
 use crate::state::{AppState, ClientStreamOptions, RequestContext};
 use crate::streaming::{
-    ToolStreamState, map_response_event_to_chat_chunk, response_output_indicates_tool_calls,
-    response_to_chat_message,
+    ToolStreamState, map_response_event_to_chat_chunk, response_to_chat_message,
 };
 use crate::types::ModelItem;
 use crate::upstream::open_upstream_response;
@@ -77,10 +76,6 @@ impl CodexAdapter {
         model: &str,
     ) -> Option<String> {
         map_response_event_to_chat_chunk(event, tool_state, chunk_id, created, model)
-    }
-
-    pub(crate) fn response_output_indicates_tool_calls(&self, response: Option<&Value>) -> bool {
-        response_output_indicates_tool_calls(response)
     }
 
     pub(crate) fn response_to_chat_message(&self, output: Option<&Value>) -> Value {

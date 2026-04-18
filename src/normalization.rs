@@ -21,6 +21,7 @@ pub(crate) async fn normalize_responses_payload(
 
     apply_model_alias(&state.model_aliases, object);
     validate_supported_model(object)?;
+    map_legacy_chat_tool_fields(object);
     map_openai_compat_fields(object);
 
     let has_messages = object.get("messages").map(Value::is_array).unwrap_or(false);
@@ -75,6 +76,7 @@ pub(crate) async fn normalize_chat_payload(
     apply_model_alias(&state.model_aliases, object);
     validate_supported_model(object)?;
     let client_options = extract_client_stream_options(object);
+    map_legacy_chat_tool_fields(object);
     map_openai_compat_fields(object);
 
     let has_messages = object.get("messages").map(Value::is_array).unwrap_or(false);
@@ -221,13 +223,21 @@ pub(crate) async fn normalize_content_parts(
                         }));
                     }
                     "image_url" => {
-                        let url = part
-                            .get("image_url")
+                        let image_url_value = part.get("image_url");
+                        let url = image_url_value
                             .and_then(|value| value.get("url").or(Some(value)))
                             .and_then(Value::as_str)
                             .unwrap_or("");
+                        let detail = image_url_value
+                            .and_then(|value| value.get("detail"))
+                            .and_then(Value::as_str)
+                            .or_else(|| part.get("detail").and_then(Value::as_str));
                         if !url.is_empty() {
-                            out.push(json!({"type":"input_image","image_url":url}));
+                            let mut normalized = json!({"type":"input_image","image_url":url});
+                            if let Some(detail) = detail {
+                                normalized["detail"] = Value::String(detail.to_string());
+                            }
+                            out.push(normalized);
                         }
                     }
                     "input_image" => {
@@ -328,7 +338,12 @@ pub(crate) async fn normalize_input_items(state: &AppState, input: &mut Value) -
                             normalize_content_parts(state, Some(&content), &role).await?;
                         item["content"] = Value::Array(normalized);
                     }
-                    Value::String(_) => {}
+                    Value::String(text) => {
+                        item["content"] = Value::Array(vec![json!({
+                            "type":text_type,
+                            "text":text
+                        })]);
+                    }
                     Value::Null => {
                         item["content"] = Value::Array(vec![json!({
                             "type":text_type,
@@ -597,6 +612,49 @@ pub(crate) fn map_openai_compat_fields(object: &mut serde_json::Map<String, Valu
     }
 }
 
+pub(crate) fn map_legacy_chat_tool_fields(object: &mut serde_json::Map<String, Value>) {
+    if object.get("tools").is_none()
+        && let Some(Value::Array(functions)) = object.remove("functions")
+    {
+        let tools = functions
+            .into_iter()
+            .map(|function| {
+                let mut tool = function;
+                if let Some(tool_object) = tool.as_object_mut() {
+                    tool_object
+                        .entry("type".to_string())
+                        .or_insert_with(|| Value::String("function".to_string()));
+                }
+                tool
+            })
+            .collect::<Vec<_>>();
+        object.insert("tools".to_string(), Value::Array(tools));
+    }
+
+    if object.get("tool_choice").is_none()
+        && let Some(function_call) = object.remove("function_call")
+    {
+        let tool_choice = match function_call {
+            Value::String(value) => Value::String(value),
+            Value::Object(mut value) => {
+                if let Some(name) = value
+                    .remove("name")
+                    .and_then(|field| field.as_str().map(ToOwned::to_owned))
+                {
+                    json!({
+                        "type": "function",
+                        "name": name,
+                    })
+                } else {
+                    Value::Object(value)
+                }
+            }
+            other => other,
+        };
+        object.insert("tool_choice".to_string(), tool_choice);
+    }
+}
+
 pub(crate) fn normalize_responses_input_shape(object: &mut serde_json::Map<String, Value>) {
     if object.get("input").is_none() {
         object.insert("input".to_string(), Value::Array(vec![]));
@@ -632,7 +690,10 @@ mod tests {
     use anyhow::Result;
     use serde_json::{Value, json};
 
-    use super::{map_openai_compat_fields, normalize_responses_payload, promote_instruction_items};
+    use super::{
+        map_legacy_chat_tool_fields, map_openai_compat_fields, normalize_responses_payload,
+        promote_instruction_items,
+    };
     use crate::test_support::test_state;
 
     #[test]
@@ -789,5 +850,67 @@ mod tests {
             Some(&json!("System rule\n\nDeveloper rule"))
         );
         assert_eq!(payload["input"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn legacy_functions_and_function_call_map_to_tools_and_tool_choice() {
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "functions".to_string(),
+            json!([{ "name": "lookup", "description": "Lookup docs", "parameters": { "type": "object" } }]),
+        );
+        payload.insert("function_call".to_string(), json!({ "name": "lookup" }));
+
+        map_legacy_chat_tool_fields(&mut payload);
+
+        assert_eq!(payload["tools"][0]["type"], json!("function"));
+        assert_eq!(payload["tools"][0]["name"], json!("lookup"));
+        assert_eq!(payload["tool_choice"], json!({ "type": "function", "name": "lookup" }));
+        assert!(payload.get("functions").is_none());
+        assert!(payload.get("function_call").is_none());
+    }
+
+    #[tokio::test]
+    async fn normalize_responses_input_items_converts_string_content_to_parts() -> Result<()> {
+        let state = test_state(String::new()).await?;
+        let mut payload = json!({
+            "model":"gpt-5.4",
+            "input":[
+                {"role":"user","content":"hello"},
+                {"role":"assistant","content":"hi"}
+            ]
+        });
+
+        normalize_responses_payload(&state, &mut payload)
+            .await
+            .map_err(|_| anyhow::anyhow!("normalization failed"))?;
+
+        assert_eq!(payload["input"][0]["content"][0], json!({"type":"input_text","text":"hello"}));
+        assert_eq!(payload["input"][1]["content"][0], json!({"type":"output_text","text":"hi"}));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn normalize_responses_preserves_image_detail() -> Result<()> {
+        let state = test_state(String::new()).await?;
+        let mut payload = json!({
+            "model":"gpt-5.4",
+            "messages":[{
+                "role":"user",
+                "content":[{
+                    "type":"image_url",
+                    "image_url":{"url":"https://example.com/a.png","detail":"high"}
+                }]
+            }]
+        });
+
+        normalize_responses_payload(&state, &mut payload)
+            .await
+            .map_err(|_| anyhow::anyhow!("normalization failed"))?;
+
+        assert_eq!(payload["input"][0]["content"][0]["type"], json!("input_image"));
+        assert_eq!(payload["input"][0]["content"][0]["image_url"], json!("https://example.com/a.png"));
+        assert_eq!(payload["input"][0]["content"][0]["detail"], json!("high"));
+        Ok(())
     }
 }

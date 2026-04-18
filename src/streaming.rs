@@ -56,16 +56,21 @@ impl ToolStreamState {
     }
 }
 
-pub(crate) fn response_output_indicates_tool_calls(response: Option<&Value>) -> bool {
+pub(crate) fn response_output_indicates_refusal(response: Option<&Value>) -> bool {
     response
         .and_then(|value| value.get("output"))
         .and_then(Value::as_array)
         .map(|items| {
             items.iter().any(|item| {
-                matches!(
-                    item.get("type").and_then(Value::as_str),
-                    Some("function_call") | Some("custom_tool_call")
-                )
+                item.get("type").and_then(Value::as_str) == Some("message")
+                    && item
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                part.get("type").and_then(Value::as_str) == Some("refusal")
+                            })
+                        })
             })
         })
         .unwrap_or(false)
@@ -264,6 +269,7 @@ pub(crate) fn map_response_event_to_chat_chunk(
 
 pub(crate) fn response_to_chat_message(output: Option<&Value>) -> Value {
     let mut text_chunks = Vec::<String>::new();
+    let mut refusal_chunks = Vec::<String>::new();
     let mut tool_calls = Vec::<Value>::new();
     let mut tool_state = ToolStreamState::default();
 
@@ -273,10 +279,19 @@ pub(crate) fn response_to_chat_message(output: Option<&Value>) -> Value {
                 Some("message") => {
                     if let Some(content) = item.get("content").and_then(Value::as_array) {
                         for part in content {
-                            if part.get("type").and_then(Value::as_str) == Some("output_text") {
-                                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                                    text_chunks.push(text.to_string());
+                            match part.get("type").and_then(Value::as_str) {
+                                Some("output_text") => {
+                                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                        text_chunks.push(text.to_string());
+                                    }
                                 }
+                                Some("refusal") => {
+                                    if let Some(text) = part.get("refusal").and_then(Value::as_str)
+                                    {
+                                        refusal_chunks.push(text.to_string());
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -316,11 +331,21 @@ pub(crate) fn response_to_chat_message(output: Option<&Value>) -> Value {
     message.insert(
         "content".to_string(),
         if text_chunks.is_empty() {
-            Value::Null
+            if refusal_chunks.is_empty() {
+                Value::Null
+            } else {
+                Value::String(refusal_chunks.join(""))
+            }
         } else {
             Value::String(text_chunks.join(""))
         },
     );
+    if !refusal_chunks.is_empty() {
+        message.insert(
+            "refusal".to_string(),
+            Value::String(refusal_chunks.join("")),
+        );
+    }
     if !tool_calls.is_empty() {
         message.insert("tool_calls".to_string(), Value::Array(tool_calls));
     }
@@ -389,7 +414,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        map_response_event_to_chat_chunk, response_to_chat_message, SseParser, ToolStreamState,
+        map_response_event_to_chat_chunk, response_output_indicates_refusal,
+        response_to_chat_message, SseParser, ToolStreamState,
     };
 
     #[test]
@@ -437,5 +463,32 @@ mod tests {
         let mut parser = SseParser::default();
         let events = parser.feed("event: message\ndata: {\"a\":1}\n\ndata: [DONE]\n\n");
         assert_eq!(events, vec!["{\"a\":1}".to_string(), "[DONE]".to_string()]);
+    }
+
+    #[test]
+    fn response_to_chat_message_preserves_refusal() {
+        let output = json!([
+            {
+                "type":"message",
+                "content":[{"type":"refusal","refusal":"I cannot do that."}]
+            }
+        ]);
+
+        let message = response_to_chat_message(Some(&output));
+
+        assert_eq!(message["content"], json!("I cannot do that."));
+        assert_eq!(message["refusal"], json!("I cannot do that."));
+    }
+
+    #[test]
+    fn response_output_indicates_refusal_detects_refusal_parts() {
+        let response = json!({
+            "output": [{
+                "type":"message",
+                "content":[{"type":"refusal","refusal":"nope"}]
+            }]
+        });
+
+        assert!(response_output_indicates_refusal(Some(&response)));
     }
 }

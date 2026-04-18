@@ -73,7 +73,7 @@ impl CodexAuth {
                 refresh_token: "test-refresh".to_string(),
                 id_token: "test-id".to_string(),
                 expires_at: Some(i64::MAX),
-                account_id: None,
+                account_id: Some("acct-test".to_string()),
             }),
             auth_path: PathBuf::from("/tmp/codex-proxy-tests-auth.json"),
             http: Client::new(),
@@ -107,6 +107,10 @@ impl CodexAuth {
             }
         }
         self.refresh_locked().await
+    }
+
+    pub(crate) async fn current_account_id(&self) -> Option<String> {
+        self.state.read().await.account_id.clone()
     }
 
     pub(crate) async fn force_refresh(&self) -> Result<String> {
