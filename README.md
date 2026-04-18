@@ -105,7 +105,9 @@ State root defaults to `./.state/`. Override with `STATE_ROOT=/path`.
 ## Publishing
 
 - `.github/workflows/ci.yml` — runs `cargo clippy -D warnings` and `cargo test` on every push and PR.
-- `.github/workflows/docker-publish.yml` — builds `linux/amd64` and pushes to
-  `mehmetbaykar/codex-proxy` on GitHub release publish. Tags emitted: `latest`,
-  the release ref (e.g. `v0.1.0`), and the short git SHA.
+- `.github/workflows/docker-publish.yml` — on GitHub release publish, builds
+  `linux/amd64` on `ubuntu-latest` and `linux/arm64` on `ubuntu-24.04-arm` in
+  parallel (each arch on its native runner, no QEMU), then merges into a
+  single multi-arch manifest pushed to `mehmetbaykar/codex-proxy`. Tags
+  emitted: `latest`, the release ref (e.g. `v0.1.0`), and the short git SHA.
 - Required repo secrets: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`.
