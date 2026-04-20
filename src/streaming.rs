@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::config::CURSOR_MAX_TOOL_CALL_ID_LEN;
@@ -494,8 +494,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        map_response_event_to_chat_chunk, response_to_chat_message, ResponseOutputAccumulator,
-        SseParser, ToolStreamState,
+        ResponseOutputAccumulator, SseParser, ToolStreamState, map_response_event_to_chat_chunk,
+        response_to_chat_message,
     };
 
     #[test]

@@ -153,7 +153,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = to_bytes(response.into_body(), usize::MAX).await?;
         let json: Value = serde_json::from_slice(&body)?;
-        assert_eq!(json["error"]["message"], json!("Unsupported route: /v1/does-not-exist. Check proxy request logs for diagnostics."));
+        assert_eq!(
+            json["error"]["message"],
+            json!(
+                "Unsupported route: /v1/does-not-exist. Check proxy request logs for diagnostics."
+            )
+        );
         Ok(())
     }
 }

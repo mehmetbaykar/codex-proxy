@@ -1,13 +1,14 @@
 use anyhow::Result;
 use axum::http::{
-    HeaderName,
-    HeaderMap,
+    HeaderMap, HeaderName,
     header::{ACCEPT_ENCODING, CONTENT_TYPE, USER_AGENT},
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
-use crate::config::{CLIENT_REQUEST_ID_HEADER, REQUEST_ID_HEADER, UPSTREAM_LOG_FILE};
+use crate::config::{
+    CLIENT_REQUEST_ID_HEADER, FORWARDED_CODEX_BETA_HEADERS, REQUEST_ID_HEADER, UPSTREAM_LOG_FILE,
+};
 use crate::logging::log_request_event;
 use crate::state::{AppState, RequestContext};
 
@@ -32,13 +33,12 @@ pub(crate) async fn build_chatgpt_upstream_headers(
     {
         headers.insert("ChatGPT-Account-Id", value);
     }
+    if let Ok(value) = axum::http::HeaderValue::from_str(state.originator.as_ref()) {
+        headers.insert("originator", value);
+    }
     if let Some(context) = request_context {
         if let Ok(value) = context.request_id.parse() {
             headers.insert("session_id", value);
-        }
-        headers.insert("originator", axum::http::HeaderValue::from_static("codex-proxy"));
-        if let Ok(value) = axum::http::HeaderValue::from_str("codex-proxy/0.2") {
-            headers.insert(USER_AGENT, value);
         }
         if let Ok(value) = axum::http::HeaderValue::from_str(&context.request_id) {
             headers.insert(REQUEST_ID_HEADER, value);
@@ -51,6 +51,13 @@ pub(crate) async fn build_chatgpt_upstream_headers(
     } else if let Some(value) = incoming_headers.get(REQUEST_ID_HEADER) {
         headers.insert(REQUEST_ID_HEADER, value.clone());
         headers.insert("session_id", value.clone());
+    }
+    for name in FORWARDED_CODEX_BETA_HEADERS {
+        if let Some(value) = incoming_headers.get(*name)
+            && let Ok(name) = HeaderName::from_bytes(name.as_bytes())
+        {
+            headers.insert(name, value.clone());
+        }
     }
     headers
 }
@@ -107,14 +114,16 @@ async fn send_upstream(
     body: &Value,
     token: &str,
 ) -> Result<reqwest::Response> {
-    let chatgpt_headers = build_chatgpt_upstream_headers(state, request_context, incoming_headers).await;
+    let chatgpt_headers =
+        build_chatgpt_upstream_headers(state, request_context, incoming_headers).await;
     let mut request = state
         .client
         .post(&state.upstream_url)
         .bearer_auth(token)
         .header(CONTENT_TYPE, "application/json")
         .header("accept", "text/event-stream")
-        .header(USER_AGENT, "codex-proxy/0.2")
+        .header("connection", "Keep-Alive")
+        .header(USER_AGENT, state.user_agent.as_ref())
         .json(body);
     if state.upstream_identity_encoding {
         request = request.header(ACCEPT_ENCODING, "identity");

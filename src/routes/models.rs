@@ -30,8 +30,8 @@ mod tests {
     use axum::body::to_bytes;
     use axum::extract::{Path, State};
     use axum::response::IntoResponse;
-    use serde_json::json;
     use serde_json::Value;
+    use serde_json::json;
 
     use super::{get_model, get_models};
     use crate::config::SUPPORTED_MODELS;

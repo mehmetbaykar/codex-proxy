@@ -5,8 +5,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tokio::fs;
 use tokio::sync::Mutex;
 
-mod codex_auth;
 mod codex_adapter;
+mod codex_auth;
 mod config;
 mod errors;
 mod files;
@@ -75,6 +75,8 @@ async fn main() -> Result<()> {
         model_aliases: config.model_aliases.clone(),
         auth: Arc::new(auth),
         codex_adapter: Arc::new(codex_adapter::CodexAdapter::new()),
+        originator: Arc::from(config.originator.as_str()),
+        user_agent: Arc::from(config.user_agent.as_str()),
     };
 
     let app = routes::build_router(state);

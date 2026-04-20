@@ -361,10 +361,7 @@ async fn aggregate_responses(
                 return upstream_error_response(response).await;
             }
             let success_headers = processed_success_headers(response.headers());
-            (
-                response.bytes_stream(),
-                success_headers,
-            )
+            (response.bytes_stream(), success_headers)
         }
         Err(err) => return upstream_open_error_response(&err),
     };
@@ -440,9 +437,10 @@ async fn aggregate_responses(
                                     }),
                                 )
                                 .await;
-                                let mut downstream_response =
-                                    Json(response).into_response();
-                                downstream_response.headers_mut().extend(success_headers.clone());
+                                let mut downstream_response = Json(response).into_response();
+                                downstream_response
+                                    .headers_mut()
+                                    .extend(success_headers.clone());
                                 if let Ok(header_value) = HeaderValue::from_str(&format!(
                                     "normalize={normalization_ms:.1}; open={upstream_open_ms:.1}; first_chunk={}; completed={response_completed_ms:.1}; total={end_to_end_ms:.1}",
                                     first_chunk_ms
@@ -627,10 +625,7 @@ async fn aggregate_chat_completion(
                 return upstream_error_response(response).await;
             }
             let success_headers = processed_success_headers(response.headers());
-            (
-                response.bytes_stream(),
-                success_headers,
-            )
+            (response.bytes_stream(), success_headers)
         }
         Err(err) => return upstream_open_error_response(&err),
     };
@@ -694,25 +689,25 @@ async fn aggregate_chat_completion(
 
 fn terminal_error_message(event: &Value) -> Option<String> {
     let event_type = event.get("type").and_then(Value::as_str)?;
-    if !matches!(
-        event_type,
-        "response.failed" | "error"
-    ) {
+    if !matches!(event_type, "response.failed" | "error") {
         return None;
     }
-    event.get("error")
+    event
+        .get("error")
         .and_then(|value| value.get("message").or(Some(value)))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .or_else(|| {
-            event.get("response")
+            event
+                .get("response")
                 .and_then(|response| response.get("error"))
                 .and_then(|value| value.get("message").or(Some(value)))
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         })
         .or_else(|| {
-            event.get("response")
+            event
+                .get("response")
                 .and_then(|response| response.get("incomplete_details"))
                 .map(|value| value.to_string())
         })
@@ -720,8 +715,7 @@ fn terminal_error_message(event: &Value) -> Option<String> {
 }
 
 fn upstream_terminal_error_response(event: &Value) -> Option<Response> {
-    terminal_error_message(event)
-        .map(|message| json_error(StatusCode::BAD_GATEWAY, &message))
+    terminal_error_message(event).map(|message| json_error(StatusCode::BAD_GATEWAY, &message))
 }
 
 fn chat_stream_error_chunk(chunk_id: &str, created: i64, model: &str, message: &str) -> String {
@@ -760,9 +754,18 @@ fn chat_terminal_error_chunk(
 /// `completion_tokens_details.reasoning_tokens` (both documented on
 /// chat.completion per the OpenAI spec) so clients that rely on them keep working.
 fn build_chat_usage(usage: &Value) -> Value {
-    let prompt_tokens = usage.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
-    let completion_tokens = usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
-    let total_tokens = usage.get("total_tokens").and_then(Value::as_i64).unwrap_or(0);
+    let prompt_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let completion_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     let mut out = json!({
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -912,8 +915,8 @@ mod tests {
     use anyhow::Result;
     use axum::Router;
     use axum::body::{Body, Bytes, to_bytes};
-    use axum::http::{HeaderValue, Request, StatusCode, header::CONTENT_TYPE};
     use axum::http::header::HeaderName;
+    use axum::http::{HeaderValue, Request, StatusCode, header::CONTENT_TYPE};
     use axum::response::Response;
     use axum::routing::post;
     use serde_json::{Value, json};
@@ -997,6 +1000,10 @@ mod tests {
                             "received_account_id": headers.get("ChatGPT-Account-Id").and_then(|v| v.to_str().ok()),
                             "received_request_id": headers.get("x-request-id").and_then(|v| v.to_str().ok()),
                             "received_client_request_id": headers.get("x-client-request-id").and_then(|v| v.to_str().ok()),
+                            "received_originator": headers.get("originator").and_then(|v| v.to_str().ok()),
+                            "received_user_agent": headers.get("user-agent").and_then(|v| v.to_str().ok()),
+                            "received_connection": headers.get("connection").and_then(|v| v.to_str().ok()),
+                            "received_beta_features": headers.get("x-codex-beta-features").and_then(|v| v.to_str().ok()),
                         }).to_string()
                     }]
                 }],
@@ -1085,12 +1092,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_streaming_chat_route_returns_incomplete_terminal_with_length_finish_reason() -> Result<()> {
+    async fn non_streaming_chat_route_returns_incomplete_terminal_with_length_finish_reason()
+    -> Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let server = tokio::spawn(async move {
-            let app =
-                Router::new().route("/backend-api/codex/responses", post(mock_upstream_incomplete));
+            let app = Router::new().route(
+                "/backend-api/codex/responses",
+                post(mock_upstream_incomplete),
+            );
             axum::serve(listener, app).await.ok();
         });
 
@@ -1125,8 +1135,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let server = tokio::spawn(async move {
-            let app = Router::new()
-                .route("/backend-api/codex/responses", post(mock_upstream_with_headers));
+            let app = Router::new().route(
+                "/backend-api/codex/responses",
+                post(mock_upstream_with_headers),
+            );
             axum::serve(listener, app).await.ok();
         });
 
@@ -1147,7 +1159,10 @@ mod tests {
 
         let response = app.oneshot(request).await?;
         assert_eq!(response.headers()["x-ratelimit-remaining-requests"], "42");
-        assert_eq!(response.headers()["llm_provider-openai-processing-ms"], "123");
+        assert_eq!(
+            response.headers()["llm_provider-openai-processing-ms"],
+            "123"
+        );
 
         server.abort();
         Ok(())
@@ -1158,8 +1173,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let server = tokio::spawn(async move {
-            let app = Router::new()
-                .route("/backend-api/codex/responses", post(capture_upstream_headers));
+            let app = Router::new().route(
+                "/backend-api/codex/responses",
+                post(capture_upstream_headers),
+            );
             axum::serve(listener, app).await.ok();
         });
 
@@ -1171,6 +1188,7 @@ mod tests {
             .header(CONTENT_TYPE, "application/json")
             .header("x-request-id", "proxy-req-123")
             .header("x-client-request-id", "client-req-789")
+            .header("x-codex-beta-features", "turn_metadata")
             .body(Body::from(
                 json!({
                     "model":"gpt-5.4",
@@ -1192,7 +1210,20 @@ mod tests {
         assert!(received["received_session_id"].as_str().is_some());
         assert_eq!(received["received_account_id"], json!("acct-test"));
         assert!(received["received_request_id"].as_str().is_some());
-        assert_eq!(received["received_client_request_id"], json!("client-req-789"));
+        assert_eq!(
+            received["received_client_request_id"],
+            json!("client-req-789")
+        );
+        assert_eq!(
+            received["received_originator"],
+            json!(crate::config::DEFAULT_ORIGINATOR)
+        );
+        assert_eq!(
+            received["received_user_agent"],
+            json!(crate::config::DEFAULT_USER_AGENT)
+        );
+        assert_eq!(received["received_connection"], json!("Keep-Alive"));
+        assert_eq!(received["received_beta_features"], json!("turn_metadata"));
 
         server.abort();
         Ok(())
@@ -1215,8 +1246,7 @@ mod tests {
             "input":[{"role":"user","content":[{"type":"input_text","text":"again"}]}]
         });
 
-        let Ok(prepared) =
-            super::prepare_ws_request(&session_state, request, "response.append")
+        let Ok(prepared) = super::prepare_ws_request(&session_state, request, "response.append")
         else {
             panic!("append should prepare successfully");
         };
@@ -1227,12 +1257,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_streaming_responses_route_returns_incomplete_terminal_as_response_object() -> Result<()> {
+    async fn non_streaming_responses_route_returns_incomplete_terminal_as_response_object()
+    -> Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let server = tokio::spawn(async move {
-            let app = Router::new()
-                .route("/backend-api/codex/responses", post(mock_upstream_incomplete));
+            let app = Router::new().route(
+                "/backend-api/codex/responses",
+                post(mock_upstream_incomplete),
+            );
             axum::serve(listener, app).await.ok();
         });
 
@@ -1414,10 +1447,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await?;
         let json: Value = serde_json::from_slice(&body)?;
-        assert_eq!(
-            json["output"][0]["content"][0]["text"],
-            json!("Hello!")
-        );
+        assert_eq!(json["output"][0]["content"][0]["text"], json!("Hello!"));
 
         server.abort();
         Ok(())

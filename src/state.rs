@@ -26,6 +26,8 @@ pub(crate) struct AppState {
     pub(crate) model_aliases: Arc<HashMap<String, String>>,
     pub(crate) auth: Arc<CodexAuth>,
     pub(crate) codex_adapter: Arc<CodexAdapter>,
+    pub(crate) originator: Arc<str>,
+    pub(crate) user_agent: Arc<str>,
 }
 
 #[derive(Clone, Default)]

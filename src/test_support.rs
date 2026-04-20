@@ -40,5 +40,7 @@ pub(crate) async fn test_state(upstream_url: impl Into<String>) -> Result<AppSta
         model_aliases: Arc::new(std::collections::HashMap::new()),
         auth: Arc::new(crate::codex_auth::CodexAuth::for_tests()),
         codex_adapter: Arc::new(CodexAdapter::new()),
+        originator: Arc::from(crate::config::DEFAULT_ORIGINATOR),
+        user_agent: Arc::from(crate::config::DEFAULT_USER_AGENT),
     })
 }

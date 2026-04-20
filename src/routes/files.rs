@@ -326,9 +326,11 @@ mod tests {
         assert_eq!(list_response.status(), StatusCode::OK);
         let list_body = to_bytes(list_response.into_body(), usize::MAX).await?;
         let listed: Value = serde_json::from_slice(&list_body)?;
-        assert!(listed["data"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item["id"] == file_id)));
+        assert!(
+            listed["data"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["id"] == file_id))
+        );
 
         let get_request = Request::builder()
             .method("GET")

@@ -167,8 +167,14 @@ mod tests {
             json!("Unsupported parameter: temperature")
         );
         assert_eq!(parsed["error"]["type"], json!("invalid_request_error"));
-        assert!(parsed["error"].get("code").is_some(), "code key must be present (null ok)");
-        assert!(parsed["error"].get("param").is_some(), "param key must be present (null ok)");
+        assert!(
+            parsed["error"].get("code").is_some(),
+            "code key must be present (null ok)"
+        );
+        assert!(
+            parsed["error"].get("param").is_some(),
+            "param key must be present (null ok)"
+        );
         Ok(())
     }
 
@@ -204,8 +210,7 @@ mod tests {
         assert_eq!(parsed["error"]["code"], json!("unsupported_route"));
         // `param` should be absent when None (serde_skip_serializing_if = Option::is_none)
         assert!(
-            parsed["error"].get("param").is_none()
-                || parsed["error"]["param"] == Value::Null,
+            parsed["error"].get("param").is_none() || parsed["error"]["param"] == Value::Null,
             "param should be absent when None"
         );
         Ok(())

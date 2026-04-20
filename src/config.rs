@@ -20,7 +20,11 @@ pub(crate) const SUPPORTED_MODELS: &[&str] = &[
 pub(crate) const DEFAULT_UPSTREAM_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
 pub(crate) const CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
-pub(crate) const DEFAULT_INSTRUCTIONS: &str = "You are Codex, a coding assistant.";
+pub(crate) const DEFAULT_ORIGINATOR: &str = "codex-tui";
+pub(crate) const DEFAULT_USER_AGENT: &str =
+    "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)";
+pub(crate) const FORWARDED_CODEX_BETA_HEADERS: &[&str] =
+    &["x-codex-beta-features", "version", "x-codex-turn-metadata"];
 pub(crate) const REQUESTS_LOG_FILE: &str = "requests.jsonl";
 pub(crate) const UPSTREAM_LOG_FILE: &str = "upstream.jsonl";
 pub(crate) const PAYLOADS_DIR_NAME: &str = "payloads";
@@ -36,6 +40,8 @@ pub(crate) struct Config {
     pub(crate) static_api_key: Option<String>,
     pub(crate) log_full_body: bool,
     pub(crate) model_aliases: Arc<HashMap<String, String>>,
+    pub(crate) originator: String,
+    pub(crate) user_agent: String,
 }
 
 impl Config {
@@ -79,6 +85,14 @@ impl Config {
             static_api_key,
             log_full_body: env_flag("PROXY_LOG_FULL_BODY") || env_flag("IS_DEBUG"),
             model_aliases: Arc::new(load_model_aliases()),
+            originator: std::env::var("CODEX_ORIGINATOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_ORIGINATOR.to_string()),
+            user_agent: std::env::var("CODEX_USER_AGENT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string()),
         }
     }
 

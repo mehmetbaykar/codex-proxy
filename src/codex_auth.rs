@@ -260,8 +260,8 @@ pub(crate) async fn run_login(auth_path: PathBuf, http: Client) -> Result<()> {
     let code = poll_for_auth_code(&http, &device).await?;
     let tokens = exchange_code_for_tokens(&http, &code).await?;
     let expires_at = parse_jwt_exp(&tokens.access_token);
-    let account_id = extract_account_id(&tokens.access_token)
-        .or_else(|| extract_account_id(&tokens.id_token));
+    let account_id =
+        extract_account_id(&tokens.access_token).or_else(|| extract_account_id(&tokens.id_token));
     let data = TokenData {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
@@ -369,10 +369,7 @@ struct ExchangedTokens {
     id_token: String,
 }
 
-async fn exchange_code_for_tokens(
-    http: &Client,
-    code: &AuthCodeResult,
-) -> Result<ExchangedTokens> {
+async fn exchange_code_for_tokens(http: &Client, code: &AuthCodeResult) -> Result<ExchangedTokens> {
     let redirect = redirect_uri();
     let form = [
         ("grant_type", "authorization_code"),

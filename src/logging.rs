@@ -87,7 +87,10 @@ async fn write_jsonl_log(state: &AppState, file_name: &str, value: &Value) {
 async fn write_dump_bytes(state: &AppState, file_name: String, bytes: &[u8]) {
     let payload_path = state.logs_dir.join(PAYLOADS_DIR_NAME).join(file_name);
     if let Err(err) = fs::write(&payload_path, bytes).await {
-        warn!("failed to write payload dump {}: {err}", payload_path.display());
+        warn!(
+            "failed to write payload dump {}: {err}",
+            payload_path.display()
+        );
     }
 }
 

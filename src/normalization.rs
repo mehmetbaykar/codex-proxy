@@ -3,7 +3,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use serde_json::{Value, json};
 
-use crate::config::{DEFAULT_INSTRUCTIONS, SUPPORTED_MODELS};
+use crate::config::SUPPORTED_MODELS;
 use crate::errors::json_error;
 use crate::state::{AppState, ClientStreamOptions};
 
@@ -57,6 +57,7 @@ pub(crate) async fn normalize_responses_payload(
     object.insert("stream".to_string(), Value::Bool(true));
     ensure_instructions(object);
     ensure_reasoning_encrypted_content(object);
+    ensure_parallel_tool_calls(object);
     map_web_search_options_to_tool(object);
     sanitize_include_values(object);
     sanitize_tool_types(object);
@@ -117,6 +118,7 @@ pub(crate) async fn normalize_chat_payload(
     object.insert("stream".to_string(), Value::Bool(true));
     ensure_instructions(object);
     ensure_reasoning_encrypted_content(object);
+    ensure_parallel_tool_calls(object);
     map_web_search_options_to_tool(object);
     sanitize_include_values(object);
     sanitize_tool_types(object);
@@ -162,8 +164,7 @@ pub(crate) async fn messages_to_input(
                     _ => false,
                 };
                 if has_content {
-                    let normalized =
-                        normalize_content_parts(state, content, "assistant").await?;
+                    let normalized = normalize_content_parts(state, content, "assistant").await?;
                     input.push(json!({"role":"assistant","content":normalized}));
                 } else if tool_calls.is_none() {
                     input.push(json!({
@@ -201,7 +202,11 @@ pub(crate) async fn normalize_content_parts(
     role: &str,
 ) -> Result<Vec<Value>> {
     let is_assistant = role == "assistant";
-    let text_type = if is_assistant { "output_text" } else { "input_text" };
+    let text_type = if is_assistant {
+        "output_text"
+    } else {
+        "input_text"
+    };
     let mut out = Vec::<Value>::new();
     match content {
         Some(Value::String(text)) => {
@@ -331,7 +336,11 @@ pub(crate) async fn normalize_input_items(state: &AppState, input: &mut Value) -
             };
         }
 
-        if let Some(role) = item.get("role").and_then(Value::as_str).map(ToOwned::to_owned) {
+        if let Some(role) = item
+            .get("role")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        {
             let text_type = if role == "assistant" {
                 "output_text"
             } else {
@@ -544,20 +553,27 @@ pub(crate) fn sanitize_upstream_payload(object: &mut serde_json::Map<String, Val
 }
 
 pub(crate) fn ensure_instructions(object: &mut serde_json::Map<String, Value>) {
-    let current = object
+    // Preserve any non-empty caller-supplied instructions. When missing/empty,
+    // match the Codex TUI upstream contract of sending `instructions: ""` unless
+    // the operator explicitly sets `CODEX_DEFAULT_INSTRUCTIONS`.
+    let current_is_nonempty = object
         .get("instructions")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
-    if current.is_empty() {
-        let default_instructions = std::env::var("CODEX_DEFAULT_INSTRUCTIONS")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_string());
-        object.insert(
-            "instructions".to_string(),
-            Value::String(default_instructions),
-        );
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    if current_is_nonempty {
+        return;
+    }
+    let fallback = std::env::var("CODEX_DEFAULT_INSTRUCTIONS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_default();
+    object.insert("instructions".to_string(), Value::String(fallback));
+}
+
+pub(crate) fn ensure_parallel_tool_calls(object: &mut serde_json::Map<String, Value>) {
+    if !object.contains_key("parallel_tool_calls") {
+        object.insert("parallel_tool_calls".to_string(), Value::Bool(true));
     }
 }
 
@@ -574,13 +590,17 @@ pub(crate) fn ensure_reasoning_encrypted_content(object: &mut serde_json::Map<St
         Some(_) => {
             object.insert(
                 "include".to_string(),
-                Value::Array(vec![Value::String("reasoning.encrypted_content".to_string())]),
+                Value::Array(vec![Value::String(
+                    "reasoning.encrypted_content".to_string(),
+                )]),
             );
         }
         None => {
             object.insert(
                 "include".to_string(),
-                Value::Array(vec![Value::String("reasoning.encrypted_content".to_string())]),
+                Value::Array(vec![Value::String(
+                    "reasoning.encrypted_content".to_string(),
+                )]),
             );
         }
     }
@@ -592,7 +612,10 @@ pub(crate) fn map_openai_compat_fields(object: &mut serde_json::Map<String, Valu
         .filter(|field| object.remove(*field).is_some())
         .collect();
     if !dropped.is_empty() {
-        tracing::debug!("dropped unsupported upstream token-cap fields: {:?}", dropped);
+        tracing::debug!(
+            "dropped unsupported upstream token-cap fields: {:?}",
+            dropped
+        );
     }
     // Codex upstream rejects service_tier values other than "priority"
     // ("400 Unsupported service_tier"). Match CLIProxyAPI: drop anything else
@@ -622,7 +645,9 @@ pub(crate) fn map_openai_compat_fields(object: &mut serde_json::Map<String, Valu
         && reasoning.get("effort").and_then(Value::as_str) == Some("minimal")
     {
         reasoning.insert("effort".to_string(), Value::String("low".to_string()));
-        tracing::debug!("clamped reasoning.effort from 'minimal' to 'low' (not supported upstream)");
+        tracing::debug!(
+            "clamped reasoning.effort from 'minimal' to 'low' (not supported upstream)"
+        );
     }
     // Only `text.format.type == "text"` is accepted by the backend. Both
     // `json_object` and `json_schema` (and the legacy `response_format` field
@@ -658,9 +683,7 @@ pub(crate) fn map_openai_compat_fields(object: &mut serde_json::Map<String, Valu
         if let Some(kind) = format_kind
             && kind != "text"
         {
-            tracing::debug!(
-                "dropped text.format.type='{kind}' (upstream only accepts 'text')"
-            );
+            tracing::debug!("dropped text.format.type='{kind}' (upstream only accepts 'text')");
             text.remove("format");
         }
         if text.is_empty() {
@@ -755,7 +778,9 @@ pub(crate) fn map_web_search_options_to_tool(object: &mut serde_json::Map<String
             }
         }
     }
-    let tools = object.entry("tools".to_string()).or_insert_with(|| Value::Array(Vec::new()));
+    let tools = object
+        .entry("tools".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
     if let Some(arr) = tools.as_array_mut() {
         arr.push(Value::Object(tool));
     }
@@ -940,7 +965,10 @@ mod tests {
 
         super::sanitize_upstream_payload(&mut payload);
 
-        assert_eq!(payload.get("prompt_cache_key"), Some(&json!("cursor-session-42")));
+        assert_eq!(
+            payload.get("prompt_cache_key"),
+            Some(&json!("cursor-session-42"))
+        );
     }
 
     #[tokio::test]
@@ -1027,9 +1055,11 @@ mod tests {
         let include = payload["include"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("include should be an array"))?;
-        assert!(include
-            .iter()
-            .all(|v| v.as_str() != Some("reasoning.summary")));
+        assert!(
+            include
+                .iter()
+                .all(|v| v.as_str() != Some("reasoning.summary"))
+        );
         assert!(include.iter().all(|v| v.as_str() != Some("usage")));
         Ok(())
     }
@@ -1069,7 +1099,10 @@ mod tests {
 
         assert_eq!(payload["tools"][0]["type"], json!("function"));
         assert_eq!(payload["tools"][0]["name"], json!("lookup"));
-        assert_eq!(payload["tool_choice"], json!({ "type": "function", "name": "lookup" }));
+        assert_eq!(
+            payload["tool_choice"],
+            json!({ "type": "function", "name": "lookup" })
+        );
         assert!(payload.get("functions").is_none());
         assert!(payload.get("function_call").is_none());
     }
@@ -1089,8 +1122,14 @@ mod tests {
             .await
             .map_err(|_| anyhow::anyhow!("normalization failed"))?;
 
-        assert_eq!(payload["input"][0]["content"][0], json!({"type":"input_text","text":"hello"}));
-        assert_eq!(payload["input"][1]["content"][0], json!({"type":"output_text","text":"hi"}));
+        assert_eq!(
+            payload["input"][0]["content"][0],
+            json!({"type":"input_text","text":"hello"})
+        );
+        assert_eq!(
+            payload["input"][1]["content"][0],
+            json!({"type":"output_text","text":"hi"})
+        );
         Ok(())
     }
 
@@ -1112,8 +1151,14 @@ mod tests {
             .await
             .map_err(|_| anyhow::anyhow!("normalization failed"))?;
 
-        assert_eq!(payload["input"][0]["content"][0]["type"], json!("input_image"));
-        assert_eq!(payload["input"][0]["content"][0]["image_url"], json!("https://example.com/a.png"));
+        assert_eq!(
+            payload["input"][0]["content"][0]["type"],
+            json!("input_image")
+        );
+        assert_eq!(
+            payload["input"][0]["content"][0]["image_url"],
+            json!("https://example.com/a.png")
+        );
         assert_eq!(payload["input"][0]["content"][0]["detail"], json!("high"));
         Ok(())
     }
@@ -1121,10 +1166,7 @@ mod tests {
     #[test]
     fn response_format_json_object_is_dropped() {
         let mut payload = serde_json::Map::new();
-        payload.insert(
-            "response_format".to_string(),
-            json!({"type":"json_object"}),
-        );
+        payload.insert("response_format".to_string(), json!({"type":"json_object"}));
         map_openai_compat_fields(&mut payload);
         assert!(
             !payload.contains_key("response_format"),
@@ -1141,7 +1183,10 @@ mod tests {
         let mut payload = serde_json::Map::new();
         payload.insert("response_format".to_string(), json!({"type":"text"}));
         map_openai_compat_fields(&mut payload);
-        assert_eq!(payload.get("text"), Some(&json!({"format":{"type":"text"}})));
+        assert_eq!(
+            payload.get("text"),
+            Some(&json!({"format":{"type":"text"}}))
+        );
     }
 
     #[test]
@@ -1150,6 +1195,58 @@ mod tests {
         payload.insert("reasoning".to_string(), json!({"effort":"minimal"}));
         map_openai_compat_fields(&mut payload);
         assert_eq!(payload.get("reasoning"), Some(&json!({"effort":"low"})));
+    }
+
+    #[tokio::test]
+    async fn missing_instructions_becomes_empty_string() -> Result<()> {
+        let state = test_state(String::new()).await?;
+        let mut payload = json!({"model":"gpt-5.4","input":"hi"});
+        normalize_responses_payload(&state, &mut payload)
+            .await
+            .map_err(|_| anyhow::anyhow!("normalization failed"))?;
+        assert_eq!(payload.get("instructions"), Some(&json!("")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn caller_supplied_instructions_preserved() -> Result<()> {
+        let state = test_state(String::new()).await?;
+        let mut payload = json!({
+            "model":"gpt-5.4",
+            "input":"hi",
+            "instructions":"Be terse."
+        });
+        normalize_responses_payload(&state, &mut payload)
+            .await
+            .map_err(|_| anyhow::anyhow!("normalization failed"))?;
+        assert_eq!(payload.get("instructions"), Some(&json!("Be terse.")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_calls_forced_true_when_missing() -> Result<()> {
+        let state = test_state(String::new()).await?;
+        let mut payload = json!({"model":"gpt-5.4","input":"hi"});
+        normalize_responses_payload(&state, &mut payload)
+            .await
+            .map_err(|_| anyhow::anyhow!("normalization failed"))?;
+        assert_eq!(payload.get("parallel_tool_calls"), Some(&json!(true)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_calls_caller_false_preserved() -> Result<()> {
+        let state = test_state(String::new()).await?;
+        let mut payload = json!({
+            "model":"gpt-5.4",
+            "input":"hi",
+            "parallel_tool_calls": false
+        });
+        normalize_responses_payload(&state, &mut payload)
+            .await
+            .map_err(|_| anyhow::anyhow!("normalization failed"))?;
+        assert_eq!(payload.get("parallel_tool_calls"), Some(&json!(false)));
+        Ok(())
     }
 
     #[test]
@@ -1292,7 +1389,9 @@ mod tests {
             let probe_name = fields.next().unwrap_or("");
             let _status = fields.next().unwrap_or("");
             let verdict = fields.next().unwrap_or("");
-            let Some(key) = top_level(probe_name) else { continue };
+            let Some(key) = top_level(probe_name) else {
+                continue;
+            };
             match verdict {
                 "accept" => assert!(
                     super::is_allowed_upstream_field(key),

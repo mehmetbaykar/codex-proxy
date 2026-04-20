@@ -31,9 +31,7 @@ pub(crate) async fn request_context_middleware(
         .map(ToOwned::to_owned);
 
     let is_public_route = matches!(path.as_str(), "/healthz");
-    if !is_public_route
-        && let Some(expected) = &state.static_api_key
-    {
+    if !is_public_route && let Some(expected) = &state.static_api_key {
         let bearer = req
             .headers()
             .get(AUTHORIZATION)
