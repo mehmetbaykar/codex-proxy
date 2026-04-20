@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::errors::{json_error, upstream_error_response, upstream_open_error_response};
 use crate::logging::{log_json_request, log_request_event};
 use crate::state::{AppState, ClientStreamOptions, RequestContext, WsSessionState};
-use crate::streaming::{SseParser, ToolStreamState};
+use crate::streaming::{ResponseOutputAccumulator, SseParser, ToolStreamState};
 use crate::upstream::processed_success_headers;
 
 pub(crate) async fn post_responses(
@@ -370,6 +370,7 @@ async fn aggregate_responses(
     };
     let upstream_open_ms = upstream_open_started_at.elapsed().as_secs_f64() * 1000.0;
     let mut parser = SseParser::default();
+    let mut accumulator = ResponseOutputAccumulator::default();
     let mut chunk_count = 0usize;
     let mut event_count = 0usize;
     let mut bytes_received = 0usize;
@@ -397,6 +398,7 @@ async fn aggregate_responses(
                         if let Some(failure) = upstream_terminal_error_response(&value) {
                             return failure;
                         }
+                        accumulator.observe(&value);
                         // `response.incomplete` is a valid terminal (e.g. hit max_output_tokens
                         // or safety cutoff). Upstream carries the partial response object with
                         // `status:"incomplete"` + `incomplete_details`; return it instead of 502.
@@ -405,6 +407,8 @@ async fn aggregate_responses(
                             Some("response.completed") | Some("response.incomplete")
                         ) {
                             if let Some(response) = value.get("response") {
+                                let mut response = response.clone();
+                                accumulator.finalize(&mut response);
                                 let response_completed_ms =
                                     aggregate_started_at.elapsed().as_secs_f64() * 1000.0;
                                 let end_to_end_ms = request_context
@@ -437,7 +441,7 @@ async fn aggregate_responses(
                                 )
                                 .await;
                                 let mut downstream_response =
-                                    Json(response.clone()).into_response();
+                                    Json(response).into_response();
                                 downstream_response.headers_mut().extend(success_headers.clone());
                                 if let Ok(header_value) = HeaderValue::from_str(&format!(
                                     "normalize={normalization_ms:.1}; open={upstream_open_ms:.1}; first_chunk={}; completed={response_completed_ms:.1}; total={end_to_end_ms:.1}",
@@ -637,6 +641,7 @@ async fn aggregate_chat_completion(
     let created = crate::files::now_unix();
     let mut parser = SseParser::default();
     let mut completed_response: Option<Value> = None;
+    let mut accumulator = ResponseOutputAccumulator::default();
 
     while let Some(item) = stream.next().await {
         if let Ok(chunk) = item {
@@ -649,6 +654,7 @@ async fn aggregate_chat_completion(
                     if let Some(failure) = upstream_terminal_error_response(&value) {
                         return failure;
                     }
+                    accumulator.observe(&value);
                     if matches!(
                         value.get("type").and_then(Value::as_str),
                         Some("response.completed") | Some("response.incomplete")
@@ -660,12 +666,13 @@ async fn aggregate_chat_completion(
         }
     }
 
-    let Some(response) = completed_response else {
+    let Some(mut response) = completed_response else {
         return json_error(
             StatusCode::BAD_GATEWAY,
             "Could not build final chat completion object",
         );
     };
+    accumulator.finalize(&mut response);
     let usage = response.get("usage").cloned().unwrap_or_else(|| json!({}));
     let finish_reason = chat_completion_finish_reason(Some(&response));
     let completion = json!({
@@ -1317,6 +1324,99 @@ mod tests {
         assert_eq!(
             json["usage"]["completion_tokens_details"]["reasoning_tokens"],
             json!(2)
+        );
+
+        server.abort();
+        Ok(())
+    }
+
+    // Reproduces the production bug where the ChatGPT/Codex upstream streams
+    // text via `response.output_text.delta` + per-item `response.output_item.done`
+    // but the terminal `response.completed` snapshot ships with `output: []`.
+    async fn mock_upstream_empty_snapshot_output() -> Response {
+        let frames = [
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo!\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello!\"}]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"total_tokens\":6}}}\n\n",
+            "data: [DONE]\n\n",
+        ];
+        let stream = async_stream::stream! {
+            for frame in frames {
+                yield Ok::<Bytes, Infallible>(Bytes::from(frame));
+            }
+        };
+        let mut response = Response::new(Body::from_stream(stream));
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        response
+    }
+
+    #[tokio::test]
+    async fn non_stream_chat_fills_content_when_snapshot_output_empty() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/backend-api/codex/responses",
+                post(mock_upstream_empty_snapshot_output),
+            );
+            axum::serve(listener, app).await.ok();
+        });
+
+        let state = test_state(format!("http://{addr}/backend-api/codex/responses")).await?;
+        let app = build_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"gpt-5.4",
+                    "messages":[{"role":"user","content":"say hi"}],
+                    "stream":false
+                })
+                .to_string(),
+            ))?;
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let json: Value = serde_json::from_slice(&body)?;
+        assert_eq!(json["choices"][0]["message"]["content"], json!("Hello!"));
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_stream_responses_fills_output_when_snapshot_empty() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/backend-api/codex/responses",
+                post(mock_upstream_empty_snapshot_output),
+            );
+            axum::serve(listener, app).await.ok();
+        });
+
+        let state = test_state(format!("http://{addr}/backend-api/codex/responses")).await?;
+        let app = build_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"model":"gpt-5.4","input":"say hi","stream":false}).to_string(),
+            ))?;
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let json: Value = serde_json::from_slice(&body)?;
+        assert_eq!(
+            json["output"][0]["content"][0]["text"],
+            json!("Hello!")
         );
 
         server.abort();

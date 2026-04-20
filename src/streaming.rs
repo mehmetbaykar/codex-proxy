@@ -419,12 +419,83 @@ pub(crate) fn parse_sse_frame_data(frame: &str) -> Option<String> {
     }
 }
 
+/// Accumulates per-item snapshots and text deltas observed during an SSE stream
+/// so non-streaming aggregators can produce a complete `response.output[]` even
+/// when the upstream terminal `response.completed` / `response.incomplete`
+/// snapshot ships with an empty `output` array.
+///
+/// The ChatGPT/Codex backend emits fully-aggregated items via
+/// `response.output_item.done` and streams message text via
+/// `response.output_text.delta`, but the terminal snapshot's `output` is
+/// observed empty in production. Without this accumulator, non-stream clients
+/// get `message.content: null` on `/v1/chat/completions` and `output: []` on
+/// `/v1/responses` despite tokens being generated.
+#[derive(Default)]
+pub(crate) struct ResponseOutputAccumulator {
+    items: Vec<Value>,
+    text_chunks: Vec<String>,
+}
+
+impl ResponseOutputAccumulator {
+    pub(crate) fn observe(&mut self, event: &Value) {
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.output_item.done") => {
+                if let Some(item) = event.get("item") {
+                    self.items.push(item.clone());
+                }
+            }
+            Some("response.output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    self.text_chunks.push(delta.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// If the snapshot already has a non-empty `output` array, leave it alone.
+    /// Otherwise, fill from accumulated per-item snapshots; if those are also
+    /// empty but text deltas arrived, synthesize a single message item.
+    pub(crate) fn finalize(&self, snapshot: &mut Value) {
+        let snapshot_has_output = snapshot
+            .get("output")
+            .and_then(Value::as_array)
+            .map(|arr| !arr.is_empty())
+            .unwrap_or(false);
+        if snapshot_has_output {
+            return;
+        }
+
+        let Some(object) = snapshot.as_object_mut() else {
+            return;
+        };
+
+        if !self.items.is_empty() {
+            object.insert("output".to_string(), Value::Array(self.items.clone()));
+            return;
+        }
+
+        if !self.text_chunks.is_empty() {
+            let synthetic = json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": self.text_chunks.join(""),
+                }],
+            });
+            object.insert("output".to_string(), Value::Array(vec![synthetic]));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::{
-        map_response_event_to_chat_chunk, response_to_chat_message, SseParser, ToolStreamState,
+        map_response_event_to_chat_chunk, response_to_chat_message, ResponseOutputAccumulator,
+        SseParser, ToolStreamState,
     };
 
     #[test]
@@ -518,6 +589,58 @@ mod tests {
         assert!(
             map_response_event_to_chat_chunk(&event, &mut tool_state, "cmp-1", 1, "gpt-5.4")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn accumulator_fills_output_from_item_done_when_snapshot_empty() {
+        let mut accumulator = ResponseOutputAccumulator::default();
+        accumulator.observe(&json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Hello!"}]
+            }
+        }));
+        let mut snapshot = json!({ "output": [] });
+        accumulator.finalize(&mut snapshot);
+        assert_eq!(snapshot["output"][0]["content"][0]["text"], json!("Hello!"));
+        let message = response_to_chat_message(snapshot.get("output"));
+        assert_eq!(message["content"], json!("Hello!"));
+    }
+
+    #[test]
+    fn accumulator_synthesizes_message_from_deltas_when_no_items() {
+        let mut accumulator = ResponseOutputAccumulator::default();
+        for chunk in ["Hel", "lo!"] {
+            accumulator.observe(&json!({
+                "type": "response.output_text.delta",
+                "delta": chunk
+            }));
+        }
+        let mut snapshot = json!({});
+        accumulator.finalize(&mut snapshot);
+        let message = response_to_chat_message(snapshot.get("output"));
+        assert_eq!(message["content"], json!("Hello!"));
+    }
+
+    #[test]
+    fn accumulator_leaves_nonempty_snapshot_output_alone() {
+        let mut accumulator = ResponseOutputAccumulator::default();
+        accumulator.observe(&json!({
+            "type": "response.output_text.delta",
+            "delta": "stray"
+        }));
+        let mut snapshot = json!({
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "canonical"}]
+            }]
+        });
+        accumulator.finalize(&mut snapshot);
+        assert_eq!(
+            snapshot["output"][0]["content"][0]["text"],
+            json!("canonical")
         );
     }
 
